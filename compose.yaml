@@ -1,0 +1,43 @@
+name: distributed-wagering-processor
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wagering
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  localstack:
+    # Last community release before LocalStack introduced mandatory licensing.
+    image: localstack/localstack:4.4.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      ACTIVATE_PRO: "0"
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./infra/localstack/init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs list-queues >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
