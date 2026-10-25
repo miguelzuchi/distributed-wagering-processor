@@ -52,10 +52,21 @@ A primeira versão terá um ponto de extensão para um Identity Provider OIDC, m
 
 ## Concorrência
 
-A unidade de serialização será a wallet. O caso de uso financeiro abrirá uma única transação SQL e obterá `SELECT ... FOR UPDATE` da wallet antes de validar saldo, resolver a direção e escrever wallet, transaction, ledger, inbox e outbox. Locks de wallets diferentes não se bloqueiam. Deadlocks e falhas transitórias terão retry limitado com jitter; erros de negócio não serão repetidos.
+A unidade de serialização financeira é a wallet. O caso de uso abre uma única transação SQL e obtém `SELECT ... FOR UPDATE` da wallet antes de validar saldo, resolver a direção e escrever wallet, transaction, ledger e outbox. Locks de wallets diferentes não se bloqueiam. Deadlocks e falhas transitórias terão retry limitado com jitter; erros de negócio não serão repetidos.
+
+Antes do lock da wallet, `pg_advisory_xact_lock(hashtextextended(idempotencyKey, 0))` serializa apenas submissões com a mesma chave, inclusive se payloads conflitantes apontarem para wallets diferentes. O lock é transacional, liberado automaticamente, e não constitui lock financeiro global.
+
+## Idempotência HTTP
+
+O hash é SHA-256 do JSON canônico do payload de negócio: objetos têm chaves ordenadas recursivamente e campos `undefined` são omitidos. Header e metadados de transporte não entram no hash. A chave tem constraint única no banco.
+
+Replay com mesmo hash retorna a transação persistida e o saldo observado originalmente; payload divergente retorna conflito. O saldo de resposta persiste valor e moeda separadamente para que até uma rejeição por conflito de moeda possa ser reproduzida exatamente.
+
+Os testes end-to-end executam 50 submissões HTTP paralelas da mesma aposta e o cenário de duas apostas de `80.00` sobre saldo `100.00` contra PostgreSQL real.
 
 ## Decisões pendentes
 
 - Taxonomia de failure codes.
 - TTL e tentativas de transações `PENDING_REFERENCE`.
 - Backoff e claim concorrente da outbox.
+- Retry limitado para deadlock/serialization failure.

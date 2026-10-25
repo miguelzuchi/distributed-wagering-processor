@@ -79,9 +79,10 @@ export class WalletsService {
           `insert into wager_transactions
             (id, provider_id, external_transaction_id, idempotency_key,
              payload_hash, wallet_id, player_id, round_id, game_id, kind,
-             amount, currency, status, result_balance, created_at, processed_at)
+             amount, currency, status, result_balance, result_balance_currency,
+             created_at, processed_at)
            values (?, '__internal__', ?, ?, ?, ?, ?, '__opening__', '__opening__',
-                   ?, ?, ?, ?, ?, ?, ?)`,
+                   ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             transactionId,
             externalTransactionId,
@@ -94,6 +95,7 @@ export class WalletsService {
             initialBalance.currency,
             WagerTransactionStatus.Processed,
             initialBalance.toJSON().amount,
+            initialBalance.currency,
             now,
             now,
           ],

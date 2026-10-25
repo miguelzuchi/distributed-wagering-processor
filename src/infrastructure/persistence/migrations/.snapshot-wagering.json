@@ -619,6 +619,23 @@
           "enumItems": [],
           "mappedType": "decimal"
         },
+        "result_balance_currency": {
+          "name": "result_balance_currency",
+          "type": "char(3)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 3,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "character"
+        },
         "round_id": {
           "name": "round_id",
           "type": "varchar(200)",
@@ -764,6 +781,12 @@
           "expression": "(result_balance IS NULL) OR (result_balance >= 0)",
           "definition": "CHECK (((result_balance IS NULL) OR (result_balance >= (0)::numeric)))",
           "columnName": "result_balance"
+        },
+        {
+          "name": "wager_transactions_result_currency_format",
+          "expression": "(result_balance_currency IS NULL) OR (result_balance_currency ~ '^[A-Z]{3}$'::text)",
+          "definition": "CHECK (((result_balance_currency IS NULL) OR (result_balance_currency ~ '^[A-Z]{3}$'::text)))",
+          "columnName": "result_balance_currency"
         },
         {
           "name": "wager_transactions_status_valid",

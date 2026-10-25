@@ -36,6 +36,11 @@ export const WagerTransactionEntity = defineEntity({
       .scale(2)
       .fieldName('result_balance')
       .nullable(),
+    resultBalanceCurrency: p
+      .string()
+      .length(3)
+      .fieldName('result_balance_currency')
+      .nullable(),
     referenceAttempts: p.integer().fieldName('reference_attempts').default(0),
     referenceNextAttemptAt: p
       .datetime()

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { MoneyProps } from '../shared/money.js';
 import { LedgerDirection } from '../wallet/wallet-ledger-entry.js';
+import { FailureCode } from '../wagering/wager-transaction.js';
 import { EventContext, IntegrationEvent } from './integration-event.js';
 
 interface WalletBalanceChangedData extends Record<string, unknown> {
@@ -49,6 +50,57 @@ export class WagerTransactionProcessed extends IntegrationEvent<WagerTransaction
     ctx: EventContext,
   ): WagerTransactionProcessed {
     return new WagerTransactionProcessed({
+      eventId: randomUUID(),
+      aggregateId: data.transactionId,
+      ...ctx,
+      data,
+    });
+  }
+}
+
+interface WagerTransactionRejectedData extends Record<string, unknown> {
+  transactionId: string;
+  walletId: string;
+  providerId: string;
+  externalTransactionId: string;
+  failureCode: FailureCode;
+  resultBalance: MoneyProps;
+}
+
+export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionRejectedData> {
+  readonly eventType = 'WagerTransactionRejected';
+  readonly version = 1;
+
+  static create(
+    data: WagerTransactionRejectedData,
+    ctx: EventContext,
+  ): WagerTransactionRejected {
+    return new WagerTransactionRejected({
+      eventId: randomUUID(),
+      aggregateId: data.transactionId,
+      ...ctx,
+      data,
+    });
+  }
+}
+
+interface WagerTransactionPendingReferenceData extends Record<string, unknown> {
+  transactionId: string;
+  walletId: string;
+  providerId: string;
+  externalTransactionId: string;
+  referenceExternalTransactionId: string;
+}
+
+export class WagerTransactionPendingReference extends IntegrationEvent<WagerTransactionPendingReferenceData> {
+  readonly eventType = 'WagerTransactionPendingReference';
+  readonly version = 1;
+
+  static create(
+    data: WagerTransactionPendingReferenceData,
+    ctx: EventContext,
+  ): WagerTransactionPendingReference {
+    return new WagerTransactionPendingReference({
       eventId: randomUUID(),
       aggregateId: data.transactionId,
       ...ctx,

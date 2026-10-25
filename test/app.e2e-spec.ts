@@ -18,6 +18,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     app = moduleFixture.createNestApplication();
     configureApplication(app);
     await app.init();
+    app.getHttpServer().setMaxListeners(100);
     entityManager = app.get(EntityManager);
   });
 
@@ -80,6 +81,204 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
         initialBalance: { amount: '10.1', currency: 'BRL' },
       })
       .expect(400);
+  });
+
+  it('debits exactly once when the same bet arrives 50 times in parallel', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const payload = {
+      providerId: 'provider-parallel-replay',
+      externalTransactionId: randomUUID(),
+      playerId,
+      walletId: wallet.body.id as string,
+      roundId: randomUUID(),
+      gameId: 'fortune-chimp',
+      kind: 'BET',
+      money: { amount: '25.00', currency: 'BRL' },
+    };
+    const idempotencyKey = `${payload.providerId}:${payload.externalTransactionId}`;
+
+    const responses = await Promise.all(
+      Array.from({ length: 50 }, () =>
+        request(app.getHttpServer())
+          .post('/wagering/transactions')
+          .set('Idempotency-Key', idempotencyKey)
+          .send(payload),
+      ),
+    );
+
+    expect(responses.filter(({ status }) => status === 201)).toHaveLength(1);
+    expect(responses.filter(({ status }) => status === 200)).toHaveLength(49);
+    expect(new Set(responses.map(({ body }) => body.transactionId)).size).toBe(
+      1,
+    );
+    const fetched = await request(app.getHttpServer())
+      .get(`/wallets/${wallet.body.id as string}`)
+      .expect(200);
+    expect(fetched.body.balance.amount).toBe('75.00');
+  });
+
+  it('serializes competing bets on one wallet without a lost update', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const base = {
+      providerId: 'provider-competing-bets',
+      playerId,
+      walletId: wallet.body.id as string,
+      roundId: randomUUID(),
+      gameId: 'fortune-chimp',
+      kind: 'BET',
+      money: { amount: '80.00', currency: 'BRL' },
+    };
+    const payloads = [
+      { ...base, externalTransactionId: randomUUID() },
+      { ...base, externalTransactionId: randomUUID() },
+    ];
+    const responses = await Promise.all(
+      payloads.map((payload) =>
+        request(app.getHttpServer())
+          .post('/wagering/transactions')
+          .set(
+            'Idempotency-Key',
+            `${payload.providerId}:${payload.externalTransactionId}`,
+          )
+          .send(payload),
+      ),
+    );
+
+    expect(responses.map(({ status }) => status).sort((a, b) => a - b)).toEqual(
+      [201, 422],
+    );
+    expect(
+      responses.find(({ status }) => status === 422)?.body.failureCode,
+    ).toBe('INSUFFICIENT_BALANCE');
+    const fetched = await request(app.getHttpServer())
+      .get(`/wallets/${wallet.body.id as string}`)
+      .expect(200);
+    expect(fetched.body.balance.amount).toBe('20.00');
+
+    const ledger = await entityManager
+      .fork()
+      .execute<Array<{ entries: string }>>(
+        `select count(*)::text as entries
+         from wallet_ledger_entries where wallet_id = ?`,
+        [wallet.body.id],
+      );
+    expect(ledger[0]?.entries).toBe('2');
+  });
+
+  it('refunds a processed bet once and replays the original response', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const walletId = wallet.body.id as string;
+    const roundId = randomUUID();
+    const betExternalId = randomUUID();
+    const bet = {
+      providerId: 'provider-refund',
+      externalTransactionId: betExternalId,
+      playerId,
+      walletId,
+      roundId,
+      gameId: 'fortune-chimp',
+      kind: 'BET',
+      money: { amount: '25.00', currency: 'BRL' },
+    };
+    await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', `${bet.providerId}:${bet.externalTransactionId}`)
+      .send(bet)
+      .expect(201);
+
+    const refund = {
+      ...bet,
+      externalTransactionId: randomUUID(),
+      kind: 'REFUND',
+      referenceExternalTransactionId: betExternalId,
+    };
+    const key = `${refund.providerId}:${refund.externalTransactionId}`;
+    const applied = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', key)
+      .send(refund)
+      .expect(201);
+    expect(applied.body.balance.amount).toBe('100.00');
+
+    const replay = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', key)
+      .send(refund)
+      .expect(200);
+    expect(replay.body).toEqual({
+      ...applied.body,
+      idempotentReplay: true,
+    });
+
+    await request(app.getHttpServer())
+      .get(`/wagering/transactions/${applied.body.transactionId as string}`)
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.status).toBe('PROCESSED');
+        expect(body.balance.amount).toBe('100.00');
+      });
+  });
+
+  it('persists an out-of-order refund as pending reference', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const refund = {
+      providerId: 'provider-out-of-order',
+      externalTransactionId: randomUUID(),
+      playerId,
+      walletId: wallet.body.id as string,
+      roundId: randomUUID(),
+      gameId: 'fortune-chimp',
+      kind: 'REFUND',
+      money: { amount: '25.00', currency: 'BRL' },
+      referenceExternalTransactionId: randomUUID(),
+    };
+    const key = `${refund.providerId}:${refund.externalTransactionId}`;
+    const pending = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', key)
+      .send(refund)
+      .expect(202);
+    expect(pending.body).toMatchObject({
+      status: 'PENDING_REFERENCE',
+      balance: { amount: '100.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+
+    const replay = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', key)
+      .send(refund)
+      .expect(200);
+    expect(replay.body.balance).toEqual(pending.body.balance);
+    expect(replay.body.idempotentReplay).toBe(true);
   });
 
   afterAll(async () => {

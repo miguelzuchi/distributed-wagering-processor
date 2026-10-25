@@ -4,9 +4,9 @@ Serviço financeiro distribuído para processar transações de apostas entregue
 
 ## Estado atual
 
-O núcleo de domínio financeiro e a migration inicial estão implementados. `Money`, `Wallet`, `WagerTransaction` e `WalletLedgerEntry` protegem as invariantes básicas e têm testes unitários. O schema inclui constraints financeiras, unicidade persistente e imutabilidade do ledger, e sua reversibilidade foi validada em PostgreSQL 16 real.
+O núcleo financeiro, abertura de wallet e processamento HTTP de transações estão implementados. `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` compartilham um caso de uso transacional com idempotência persistente, lock por wallet, ledger e outbox. Referências ausentes são persistidas como `PENDING_REFERENCE`.
 
-Ainda estão em desenvolvimento os casos de uso, endpoints, inbox/outbox, workers SQS, observabilidade e testes de concorrência entre processos.
+Há testes de concorrência HTTP contra PostgreSQL real, incluindo 50 replays paralelos e apostas disputando o mesmo saldo. Ainda estão em desenvolvimento inbox, workers SQS/outbox, reprocessamento agendado, reconciliação, health checks, observabilidade e testes entre múltiplos processos.
 
 ## Stack
 
