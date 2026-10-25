@@ -52,6 +52,13 @@ interface TransactionRow {
   reference_transaction_id?: string;
 }
 
+interface PendingRow extends TransactionRow {
+  idempotency_key: string;
+  game_id: string;
+  reference_external_transaction_id: string;
+  reference_attempts: number;
+}
+
 export interface WagerTransactionResponse {
   transactionId: string;
   status: WagerTransactionStatus;
@@ -430,6 +437,178 @@ export class WageringService {
     );
     if (!row) throw new NotFoundException('Transaction not found');
     return this.toResponse(row, false);
+  }
+
+  async reprocessDueReferences(): Promise<number> {
+    const due = await this.entityManager.fork().execute<Array<{ id: string }>>(
+      `select id from wager_transactions
+        where status = 'PENDING_REFERENCE'
+          and reference_next_attempt_at <= now()
+        order by reference_next_attempt_at limit 25`,
+    );
+    let processed = 0;
+    for (const { id } of due) {
+      if (await this.reprocessReference(id)) processed += 1;
+    }
+    return processed;
+  }
+
+  private async reprocessReference(id: string): Promise<boolean> {
+    return this.entityManager.fork().transactional(async (em) => {
+      const pending = await em.execute<PendingRow>(
+        `select id, provider_id, external_transaction_id, idempotency_key,
+                payload_hash, wallet_id, player_id, round_id, game_id, kind,
+                amount::text, currency, status, failure_code,
+                result_balance::text, result_balance_currency,
+                reference_transaction_id, reference_external_transaction_id,
+                reference_attempts
+           from wager_transactions where id = ? and status = 'PENDING_REFERENCE'
+           for update skip locked`,
+        [id],
+        'get',
+      );
+      if (!pending) return false;
+      const walletRow = await em.execute<WalletRow>(
+        `select id, player_id, currency, balance::text, version,
+                created_at, updated_at from wallets where id = ? for update`,
+        [pending.wallet_id],
+        'get',
+      );
+      if (!walletRow) return false;
+      const input = Object.assign(new SubmitWagerTransactionDto(), {
+        providerId: pending.provider_id,
+        externalTransactionId: pending.external_transaction_id,
+        playerId: pending.player_id,
+        walletId: pending.wallet_id,
+        roundId: pending.round_id,
+        gameId: pending.game_id,
+        kind: pending.kind,
+        money: { amount: pending.amount, currency: pending.currency },
+        referenceExternalTransactionId:
+          pending.reference_external_transaction_id,
+      });
+      const money = Money.from(input.money);
+      const wallet = Wallet.rehydrate({
+        id: walletRow.id,
+        playerId: walletRow.player_id,
+        currency: walletRow.currency,
+        balance: Money.from({
+          amount: walletRow.balance,
+          currency: walletRow.currency,
+        }),
+        version: walletRow.version,
+        createdAt: walletRow.created_at,
+        updatedAt: walletRow.updated_at,
+      });
+      const reference = await this.findReference(em, input);
+      const now = new Date();
+      if (!reference) {
+        const attempts = pending.reference_attempts + 1;
+        if (attempts >= 8) {
+          await this.rejectExisting(
+            em,
+            pending.id,
+            input,
+            wallet,
+            FailureCode.ReferenceNotFound,
+            now,
+          );
+          return true;
+        }
+        const delay = Math.min(60_000, 1_000 * 2 ** attempts);
+        await em.execute(
+          `update wager_transactions set reference_attempts = ?,
+                  reference_next_attempt_at = ? where id = ?`,
+          [attempts, new Date(Date.now() + delay), pending.id],
+        );
+        return false;
+      }
+      const failure = await this.validateReference(em, input, money, reference);
+      if (failure) {
+        await this.rejectExisting(em, pending.id, input, wallet, failure, now);
+        return true;
+      }
+      const direction =
+        input.kind === WagerTransactionKind.Refund ||
+        reference.kind === WagerTransactionKind.Bet
+          ? LedgerDirection.Credit
+          : LedgerDirection.Debit;
+      const before = wallet.balance;
+      try {
+        if (direction === LedgerDirection.Credit) {
+          wallet.credit(money, now);
+        } else {
+          wallet.debit(money, now);
+        }
+      } catch {
+        await this.rejectExisting(
+          em,
+          pending.id,
+          input,
+          wallet,
+          FailureCode.ReversalWouldMakeBalanceNegative,
+          now,
+        );
+        return true;
+      }
+      await em.execute(
+        `update wallets set balance = ?, version = ?, updated_at = ? where id = ?`,
+        [wallet.balance.toJSON().amount, wallet.version, now, wallet.id],
+      );
+      await em.execute(
+        `insert into wallet_ledger_entries
+          (id, wallet_id, transaction_id, direction, amount, currency,
+           balance_before, balance_after, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          randomUUID(),
+          wallet.id,
+          pending.id,
+          direction,
+          money.toJSON().amount,
+          money.currency,
+          before.toJSON().amount,
+          wallet.balance.toJSON().amount,
+          now,
+        ],
+      );
+      await this.markProcessed(
+        em,
+        pending.id,
+        wallet.balance.toJSON().amount,
+        wallet.currency,
+        reference.id,
+        now,
+      );
+      const event = await this.enqueueProcessed(
+        em,
+        pending.id,
+        input,
+        money,
+        wallet.balance,
+        now,
+      );
+      await this.enqueue(
+        em,
+        WalletBalanceChanged.create(
+          {
+            walletId: wallet.id,
+            transactionId: pending.id,
+            direction,
+            money: money.toJSON(),
+            balanceBefore: before.toJSON(),
+            balanceAfter: wallet.balance.toJSON(),
+            walletVersion: wallet.version,
+          },
+          {
+            correlationId: pending.idempotency_key,
+            causationId: event.eventId,
+            occurredAt: now,
+          },
+        ),
+      );
+      return true;
+    });
   }
 
   private async insertPending(

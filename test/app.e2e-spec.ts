@@ -321,6 +321,38 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       .expect(200);
     expect(replay.body.balance).toEqual(pending.body.balance);
     expect(replay.body.idempotentReplay).toBe(true);
+
+    const betExternalTransactionId = refund.referenceExternalTransactionId;
+    await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set(
+        'Idempotency-Key',
+        `${refund.providerId}:${betExternalTransactionId}`,
+      )
+      .send({
+        ...refund,
+        externalTransactionId: betExternalTransactionId,
+        kind: 'BET',
+        referenceExternalTransactionId: undefined,
+      })
+      .expect(201);
+
+    const deadline = Date.now() + 5_000;
+    let resolvedStatus = 'PENDING_REFERENCE';
+    while (resolvedStatus === 'PENDING_REFERENCE' && Date.now() < deadline) {
+      const result = await request(app.getHttpServer()).get(
+        `/wagering/transactions/${pending.body.transactionId as string}`,
+      );
+      resolvedStatus = result.body.status as string;
+      if (resolvedStatus === 'PENDING_REFERENCE') {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    expect(resolvedStatus).toBe('PROCESSED');
+    const finalWallet = await request(app.getHttpServer())
+      .get(`/wallets/${wallet.body.id as string}`)
+      .expect(200);
+    expect(finalWallet.body.balance.amount).toBe('100.00');
   });
 
   it('paginates ledger with an opaque cursor and reconciles the wallet', async () => {

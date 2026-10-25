@@ -54,6 +54,8 @@ Um teste end-to-end envia uma mensagem FIFO ao LocalStack, espera a inbox proces
 
 Eventos de integração são publicados em `wager-events.fifo`. Publishers concorrentes reivindicam lotes com `FOR UPDATE SKIP LOCKED`; sucesso grava `published_at`, enquanto falha incrementa `attempts` e agenda backoff exponencial limitado a 60 segundos. O envio ocorre antes da marcação no banco, portanto uma queda nesse intervalo pode duplicar a publicação, mas nunca perder um evento. `eventId` é usado como deduplication ID e também permite deduplicação persistente no consumidor.
 
+Referências pendentes são examinadas em lotes de 25. Cada item é reprocessado em transação própria, com locks da transação e da wallet. O backoff é exponencial e limitado a 60 segundos; após oito tentativas sem referência, a transação é rejeitada com `REFERENCE_NOT_FOUND`. O teste fora de ordem entrega o REFUND antes da BET e comprova a aplicação posterior automática.
+
 ## Autenticação
 
 A primeira versão terá um ponto de extensão para um Identity Provider OIDC, mas não implementará autenticação. A decisão preserva o timebox para os itens que pontuam: correção financeira, concorrência e tolerância a falhas.
@@ -81,6 +83,5 @@ A reconciliação soma créditos e débitos diretamente do ledger e compara com 
 ## Decisões pendentes
 
 - Taxonomia de failure codes.
-- TTL e tentativas de transações `PENDING_REFERENCE`.
 - Backoff e claim concorrente da outbox.
 - Retry limitado para deadlock/serialization failure.
