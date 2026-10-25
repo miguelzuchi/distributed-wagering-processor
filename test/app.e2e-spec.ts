@@ -24,6 +24,18 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
 
   it('reports the process as available', async () => {
     await request(app.getHttpServer()).get('/').expect(200, 'Hello World!');
+    await request(app.getHttpServer())
+      .get('/health/live')
+      .expect(200, { status: 'ok' });
+    await request(app.getHttpServer())
+      .get('/health/ready')
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toEqual({
+          status: 'ok',
+          checks: { postgres: true, sqs: true },
+        });
+      });
   });
 
   it('creates wallet, opening ledger, and outbox atomically', async () => {
@@ -279,6 +291,62 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       .expect(200);
     expect(replay.body.balance).toEqual(pending.body.balance);
     expect(replay.body.idempotentReplay).toBe(true);
+  });
+
+  it('paginates ledger with an opaque cursor and reconciles the wallet', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const walletId = wallet.body.id as string;
+    for (const amount of ['10.00', '15.00']) {
+      const externalTransactionId = randomUUID();
+      await request(app.getHttpServer())
+        .post('/wagering/transactions')
+        .set('Idempotency-Key', `provider-pagination:${externalTransactionId}`)
+        .send({
+          providerId: 'provider-pagination',
+          externalTransactionId,
+          playerId,
+          walletId,
+          roundId: randomUUID(),
+          gameId: 'fortune-chimp',
+          kind: 'BET',
+          money: { amount, currency: 'BRL' },
+        })
+        .expect(201);
+    }
+
+    const first = await request(app.getHttpServer())
+      .get(`/wallets/${walletId}/ledger?limit=2`)
+      .expect(200);
+    expect(first.body.entries).toHaveLength(2);
+    expect(first.body.nextCursor).toEqual(expect.any(String));
+    const second = await request(app.getHttpServer())
+      .get(
+        `/wallets/${walletId}/ledger?limit=2&cursor=${encodeURIComponent(first.body.nextCursor as string)}`,
+      )
+      .expect(200);
+    expect(second.body.entries).toHaveLength(1);
+    expect(second.body.nextCursor).toBeNull();
+
+    await request(app.getHttpServer())
+      .post(`/wallets/${walletId}/reconciliation`)
+      .expect(201)
+      .expect(({ body }) => {
+        expect(body).toMatchObject({
+          walletId,
+          storedBalance: { amount: '75.00', currency: 'BRL' },
+          calculatedBalance: { amount: '75.00', currency: 'BRL' },
+          difference: { amount: '0.00', currency: 'BRL' },
+          consistent: true,
+          checkedEntries: 3,
+        });
+      });
   });
 
   afterAll(async () => {

@@ -6,7 +6,7 @@ Serviço financeiro distribuído para processar transações de apostas entregue
 
 O núcleo financeiro, abertura de wallet e processamento HTTP de transações estão implementados. `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` compartilham um caso de uso transacional com idempotência persistente, lock por wallet, ledger e outbox. Referências ausentes são persistidas como `PENDING_REFERENCE`.
 
-Há testes de concorrência HTTP contra PostgreSQL real, incluindo 50 replays paralelos e apostas disputando o mesmo saldo. Ainda estão em desenvolvimento inbox, workers SQS/outbox, reprocessamento agendado, reconciliação, health checks, observabilidade e testes entre múltiplos processos.
+Há testes de concorrência HTTP contra PostgreSQL real, incluindo 50 replays paralelos e apostas disputando o mesmo saldo. Ledger paginado, reconciliação e health checks de PostgreSQL/SQS também estão disponíveis. Ainda estão em desenvolvimento inbox, workers SQS/outbox, reprocessamento agendado, métricas e testes entre múltiplos processos.
 
 ## Stack
 

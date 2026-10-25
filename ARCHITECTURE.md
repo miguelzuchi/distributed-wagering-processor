@@ -64,6 +64,12 @@ Replay com mesmo hash retorna a transação persistida e o saldo observado origi
 
 Os testes end-to-end executam 50 submissões HTTP paralelas da mesma aposta e o cenário de duas apostas de `80.00` sobre saldo `100.00` contra PostgreSQL real.
 
+## Consultas e reconciliação
+
+O ledger usa keyset pagination por `(created_at, id)` em ordem decrescente. O cursor é um token Base64URL opaco, validado antes de entrar na consulta; não há paginação por offset instável.
+
+A reconciliação soma créditos e débitos diretamente do ledger e compara com o saldo materializado. Divergências são retornadas e logadas, nunca corrigidas implicitamente. Liveness não consulta dependências; readiness exige PostgreSQL e a fila SQS configurada.
+
 ## Decisões pendentes
 
 - Taxonomia de failure codes.

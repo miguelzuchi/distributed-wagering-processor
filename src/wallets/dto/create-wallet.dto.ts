@@ -1,10 +1,14 @@
 import { Type } from 'class-transformer';
 import {
+  IsInt,
   IsNotEmpty,
+  IsOptional,
   IsString,
   IsUUID,
   Matches,
   ValidateNested,
+  Max,
+  Min,
 } from 'class-validator';
 
 export class MoneyDto {
@@ -30,4 +34,17 @@ export class WalletIdParamDto {
   @IsString()
   @IsNotEmpty()
   walletId!: string;
+}
+
+export class LedgerQueryDto {
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit = 50;
 }

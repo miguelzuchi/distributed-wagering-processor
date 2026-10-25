@@ -3,6 +3,8 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { UniqueConstraintViolationException } from '@mikro-orm/core';
 import { EntityManager } from '@mikro-orm/postgresql';
@@ -17,6 +19,7 @@ import {
   WalletBalanceChanged,
 } from '../domain/events/wallet-events.js';
 import { CreateWalletDto } from './dto/create-wallet.dto.js';
+import { LedgerQueryDto } from './dto/create-wallet.dto.js';
 
 interface WalletRow {
   id: string;
@@ -33,8 +36,26 @@ export interface WalletResponse {
   version: number;
 }
 
+interface LedgerRow {
+  id: string;
+  transaction_id: string;
+  direction: LedgerDirection;
+  amount: string;
+  currency: string;
+  balance_before: string;
+  balance_after: string;
+  created_at: Date | string;
+}
+
+interface LedgerCursor {
+  createdAt: string;
+  id: string;
+}
+
 @Injectable()
 export class WalletsService {
+  private readonly logger = new Logger(WalletsService.name);
+
   constructor(private readonly entityManager: EntityManager) {}
 
   async create(input: CreateWalletDto): Promise<WalletResponse> {
@@ -188,6 +209,112 @@ export class WalletsService {
       throw new NotFoundException('Wallet not found');
     }
     return this.toResponse(row);
+  }
+
+  async listLedger(walletId: string, query: LedgerQueryDto) {
+    await this.getById(walletId);
+    const cursor = query.cursor ? this.decodeCursor(query.cursor) : undefined;
+    const params: unknown[] = [walletId];
+    let cursorCondition = '';
+    if (cursor) {
+      cursorCondition = 'and (created_at, id) < (?::timestamptz, ?::uuid)';
+      params.push(cursor.createdAt, cursor.id);
+    }
+    params.push(query.limit + 1);
+    const rows = await this.entityManager.fork().execute<LedgerRow[]>(
+      `select id, transaction_id, direction, amount::text, currency,
+              balance_before::text, balance_after::text, created_at
+         from wallet_ledger_entries
+        where wallet_id = ? ${cursorCondition}
+        order by created_at desc, id desc
+        limit ?`,
+      params,
+    );
+    const hasMore = rows.length > query.limit;
+    const page = rows.slice(0, query.limit);
+    const last = page.at(-1);
+    return {
+      entries: page.map((row) => ({
+        id: row.id,
+        transactionId: row.transaction_id,
+        direction: row.direction,
+        money: { amount: row.amount, currency: row.currency },
+        balanceBefore: { amount: row.balance_before, currency: row.currency },
+        balanceAfter: { amount: row.balance_after, currency: row.currency },
+        createdAt: this.toISOString(row.created_at),
+      })),
+      nextCursor:
+        hasMore && last
+          ? Buffer.from(
+              JSON.stringify({
+                createdAt: this.toISOString(last.created_at),
+                id: last.id,
+              }),
+            ).toString('base64url')
+          : null,
+    };
+  }
+
+  async reconcile(walletId: string) {
+    const wallet = await this.getById(walletId);
+    const result = await this.entityManager.fork().execute<{
+      calculated_balance: string;
+      checked_entries: number;
+    }>(
+      `select coalesce(sum(
+                case direction when 'CREDIT' then amount else -amount end
+              ), 0)::numeric(20,2)::text as calculated_balance,
+              count(*)::int as checked_entries
+         from wallet_ledger_entries where wallet_id = ?`,
+      [walletId],
+      'get',
+    );
+    const stored = Money.from(wallet.balance);
+    const calculated = Money.from({
+      amount: result.calculated_balance,
+      currency: wallet.balance.currency,
+    });
+    const difference = stored.subtract(calculated);
+    const consistent = difference.isZero();
+    if (!consistent) {
+      this.logger.error({
+        event: 'wallet_reconciliation_divergence',
+        walletId,
+        checkedEntries: result.checked_entries,
+      });
+    }
+    return {
+      walletId,
+      storedBalance: stored.toJSON(),
+      calculatedBalance: calculated.toJSON(),
+      difference: difference.toJSON(),
+      consistent,
+      checkedEntries: result.checked_entries,
+    };
+  }
+
+  private decodeCursor(value: string): LedgerCursor {
+    try {
+      const parsed = JSON.parse(
+        Buffer.from(value, 'base64url').toString('utf8'),
+      ) as LedgerCursor;
+      if (
+        typeof parsed.createdAt !== 'string' ||
+        Number.isNaN(Date.parse(parsed.createdAt)) ||
+        !/^[0-9a-f-]{36}$/i.test(parsed.id)
+      ) {
+        throw new Error('Invalid shape');
+      }
+      return parsed;
+    } catch {
+      throw new BadRequestException('Invalid ledger cursor');
+    }
+  }
+
+  private toISOString(value: Date | string): string {
+    return typeof value === 'string'
+      ? new Date(value).toISOString()
+      : value.toISOString();
   }
 
   private toResponse(row: WalletRow): WalletResponse {
