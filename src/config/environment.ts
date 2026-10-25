@@ -13,6 +13,7 @@ export interface Environment {
     endpoint: string;
     wagerQueueUrl: string;
     wagerDlqUrl: string;
+    eventsQueueUrl: string;
   };
 }
 
@@ -63,6 +64,9 @@ export function loadEnvironment(): Environment {
       wagerDlqUrl:
         process.env.SQS_WAGER_DLQ_URL ??
         'http://localhost:4566/000000000000/wager-transactions-dlq.fifo',
+      eventsQueueUrl:
+        process.env.SQS_EVENTS_QUEUE_URL ??
+        'http://localhost:4566/000000000000/wager-events.fifo',
     },
   };
 }

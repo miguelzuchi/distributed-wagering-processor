@@ -85,6 +85,27 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       );
     expect(rows[0]).toEqual({ ledger_entries: '1', outbox_events: '2' });
 
+    const publishDeadline = Date.now() + 5_000;
+    let publishedEvents = 0;
+    while (publishedEvents < 2 && Date.now() < publishDeadline) {
+      const published = await entityManager.fork().execute<{
+        count: number;
+      }>(
+        `select count(*)::int as count from outbox_messages
+          where aggregate_id in (
+            ?::uuid,
+            (select transaction_id from wallet_ledger_entries where wallet_id = ? limit 1)
+          ) and published_at is not null`,
+        [walletId, walletId],
+        'get',
+      );
+      publishedEvents = published.count;
+      if (publishedEvents < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    expect(publishedEvents).toBe(2);
+
     await request(app.getHttpServer())
       .post('/wallets')
       .send({

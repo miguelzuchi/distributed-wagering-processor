@@ -52,6 +52,8 @@ Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e m
 
 Um teste end-to-end envia uma mensagem FIFO ao LocalStack, espera a inbox processada e reenvia o mesmo `messageId`, comprovando um único débito.
 
+Eventos de integração são publicados em `wager-events.fifo`. Publishers concorrentes reivindicam lotes com `FOR UPDATE SKIP LOCKED`; sucesso grava `published_at`, enquanto falha incrementa `attempts` e agenda backoff exponencial limitado a 60 segundos. O envio ocorre antes da marcação no banco, portanto uma queda nesse intervalo pode duplicar a publicação, mas nunca perder um evento. `eventId` é usado como deduplication ID e também permite deduplicação persistente no consumidor.
+
 ## Autenticação
 
 A primeira versão terá um ponto de extensão para um Identity Provider OIDC, mas não implementará autenticação. A decisão preserva o timebox para os itens que pontuam: correção financeira, concorrência e tolerância a falhas.

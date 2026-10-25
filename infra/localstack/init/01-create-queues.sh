@@ -3,10 +3,16 @@ set -eu
 
 DLQ_NAME="wager-transactions-dlq.fifo"
 QUEUE_NAME="wager-transactions.fifo"
+EVENTS_QUEUE_NAME="wager-events.fifo"
 
 awslocal sqs create-queue \
   --queue-name "$DLQ_NAME" \
   --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"true"}' \
+  >/dev/null
+
+awslocal sqs create-queue \
+  --queue-name "$EVENTS_QUEUE_NAME" \
+  --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false"}' \
   >/dev/null
 
 DLQ_URL="$(awslocal sqs get-queue-url --queue-name "$DLQ_NAME" --query QueueUrl --output text)"
