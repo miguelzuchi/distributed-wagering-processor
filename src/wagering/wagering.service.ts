@@ -60,6 +60,13 @@ export interface WagerTransactionResponse {
   idempotentReplay: boolean;
 }
 
+export interface InboxContext {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+  receivedAt: Date;
+}
+
 @Injectable()
 export class WageringService {
   constructor(private readonly entityManager: EntityManager) {}
@@ -67,6 +74,7 @@ export class WageringService {
   async submit(
     input: SubmitWagerTransactionDto,
     idempotencyKey: string,
+    inbox?: InboxContext,
   ): Promise<WagerTransactionResponse> {
     if (input.kind === WagerTransactionKind.Opening) {
       throw new BadRequestException('OPENING is an internal transaction');
@@ -96,6 +104,52 @@ export class WageringService {
         idempotencyKey,
       ]);
 
+      let shouldCompleteInbox = false;
+      if (inbox) {
+        const existingInbox = await em.execute<{
+          payload_hash: string;
+          processed_at?: string;
+        }>(
+          `select payload_hash, processed_at
+             from inbox_messages
+            where consumer_name = ? and message_id = ?`,
+          [inbox.consumerName, inbox.messageId],
+          'get',
+        );
+        if (existingInbox) {
+          if (existingInbox.payload_hash !== inbox.payloadHash) {
+            throw new ConflictException(
+              'Inbox message ID was reused with a different payload',
+            );
+          }
+        } else {
+          await em.execute(
+            `insert into inbox_messages
+              (consumer_name, message_id, payload_hash, received_at)
+             values (?, ?, ?, ?)`,
+            [
+              inbox.consumerName,
+              inbox.messageId,
+              inbox.payloadHash,
+              inbox.receivedAt,
+            ],
+          );
+        }
+        shouldCompleteInbox = !existingInbox?.processed_at;
+      }
+      const complete = async (
+        result: WagerTransactionResponse,
+      ): Promise<WagerTransactionResponse> => {
+        if (inbox && shouldCompleteInbox) {
+          await em.execute(
+            `update inbox_messages set processed_at = ?
+              where consumer_name = ? and message_id = ?`,
+            [new Date(), inbox.consumerName, inbox.messageId],
+          );
+        }
+        return result;
+      };
+
       const replay = await this.findByIdempotencyKey(em, idempotencyKey);
       if (replay) {
         if (replay.payload_hash !== payloadHash) {
@@ -103,7 +157,7 @@ export class WageringService {
             'Idempotency key was already used with a different payload',
           );
         }
-        return this.toResponse(replay, true);
+        return complete(this.toResponse(replay, true));
       }
 
       const walletRow = await em.execute<WalletRow>(
@@ -133,14 +187,16 @@ export class WageringService {
         updatedAt: walletRow.updated_at,
       });
       if (wallet.currency !== money.currency) {
-        return this.persistRejected(
-          em,
-          input,
-          idempotencyKey,
-          payloadHash,
-          wallet,
-          money,
-          FailureCode.CurrencyMismatch,
+        return complete(
+          await this.persistRejected(
+            em,
+            input,
+            idempotencyKey,
+            payloadHash,
+            wallet,
+            money,
+            FailureCode.CurrencyMismatch,
+          ),
         );
       }
 
@@ -173,10 +229,12 @@ export class WageringService {
           wallet.balance,
           now,
         );
-        return this.response(
-          transactionId,
-          WagerTransactionStatus.Processed,
-          wallet.balance,
+        return complete(
+          this.response(
+            transactionId,
+            WagerTransactionStatus.Processed,
+            wallet.balance,
+          ),
         );
       }
 
@@ -213,10 +271,12 @@ export class WageringService {
             { correlationId: idempotencyKey, occurredAt: now },
           );
           await this.enqueue(em, event);
-          return this.response(
-            transactionId,
-            WagerTransactionStatus.PendingReference,
-            wallet.balance,
+          return complete(
+            this.response(
+              transactionId,
+              WagerTransactionStatus.PendingReference,
+              wallet.balance,
+            ),
           );
         }
 
@@ -227,13 +287,15 @@ export class WageringService {
           reference,
         );
         if (failure) {
-          return this.rejectExisting(
-            em,
-            transactionId,
-            input,
-            wallet,
-            failure,
-            now,
+          return complete(
+            await this.rejectExisting(
+              em,
+              transactionId,
+              input,
+              wallet,
+              failure,
+              now,
+            ),
           );
         }
         direction =
@@ -260,13 +322,15 @@ export class WageringService {
           input.kind === WagerTransactionKind.Bet
             ? FailureCode.InsufficientBalance
             : FailureCode.ReversalWouldMakeBalanceNegative;
-        return this.rejectExisting(
-          em,
-          transactionId,
-          input,
-          wallet,
-          failure,
-          now,
+        return complete(
+          await this.rejectExisting(
+            em,
+            transactionId,
+            input,
+            wallet,
+            failure,
+            now,
+          ),
         );
       }
 
@@ -326,10 +390,12 @@ export class WageringService {
         },
       );
       await this.enqueue(em, balanceChanged);
-      return this.response(
-        transactionId,
-        WagerTransactionStatus.Processed,
-        wallet.balance,
+      return complete(
+        this.response(
+          transactionId,
+          WagerTransactionStatus.Processed,
+          wallet.balance,
+        ),
       );
     });
   }

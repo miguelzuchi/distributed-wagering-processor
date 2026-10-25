@@ -8,6 +8,7 @@ import mikroOrmConfig from './infrastructure/persistence/mikro-orm.config.js';
 import { WalletsModule } from './wallets/wallets.module.js';
 import { WageringModule } from './wagering/wagering.module.js';
 import { HealthModule } from './health/health.module.js';
+import { MessagingModule } from './messaging/messaging.module.js';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { HealthModule } from './health/health.module.js';
     WalletsModule,
     WageringModule,
     HealthModule,
+    MessagingModule,
   ],
   controllers: [AppController],
   providers: [AppService],

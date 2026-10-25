@@ -46,6 +46,12 @@ A migration inicial foi validada em PostgreSQL 16 real nos dois sentidos (`up`, 
 
 O LocalStack cria duas filas FIFO durante o startup. A fila principal usa a DLQ como redrive policy com `maxReceiveCount` igual a cinco. Deduplicação do broker não substituirá inbox nem idempotência persistente.
 
+O consumidor reutiliza `WageringService.submit`, passando um contexto de inbox. Inbox, transação financeira, wallet, ledger e outbox são confirmados na mesma transação PostgreSQL. O ACK (`DeleteMessage`) ocorre somente depois que o caso de uso retorna, portanto depois do commit.
+
+Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e mensagens inválidas ficam sem ACK; a visibility timeout permite redelivery e a redrive policy encaminha à DLQ após cinco recebimentos. `OnModuleDestroy` interrompe novos polls e destrói o cliente SQS.
+
+Um teste end-to-end envia uma mensagem FIFO ao LocalStack, espera a inbox processada e reenvia o mesmo `messageId`, comprovando um único débito.
+
 ## Autenticação
 
 A primeira versão terá um ponto de extensão para um Identity Provider OIDC, mas não implementará autenticação. A decisão preserva o timebox para os itens que pontuam: correção financeira, concorrência e tolerância a falhas.

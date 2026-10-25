@@ -2,14 +2,18 @@ import { randomUUID } from 'node:crypto';
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { EntityManager } from '@mikro-orm/postgresql';
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import request from 'supertest';
 import { App } from 'supertest/types.js';
 import { AppModule } from '../src/app.module.js';
 import { configureApplication } from '../src/configure-application.js';
+import { loadEnvironment } from '../src/config/environment.js';
 
 describe('HTTP API (e2e with PostgreSQL)', () => {
   let app: INestApplication<App>;
   let entityManager: EntityManager;
+  let sqs: SQSClient;
+  const environment = loadEnvironment();
 
   beforeAll(async () => {
     const moduleFixture = await Test.createTestingModule({
@@ -20,6 +24,11 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     await app.init();
     app.getHttpServer().setMaxListeners(100);
     entityManager = app.get(EntityManager);
+    sqs = new SQSClient({
+      region: environment.sqs.region,
+      endpoint: environment.sqs.endpoint,
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+    });
   });
 
   it('reports the process as available', async () => {
@@ -349,7 +358,88 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       });
   });
 
+  it('processes and deduplicates a real SQS message through the inbox', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const walletId = wallet.body.id as string;
+    const messageId = randomUUID();
+    const externalTransactionId = randomUUID();
+    const envelope = {
+      messageId,
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'provider-sqs',
+        externalTransactionId,
+        idempotencyKey: `provider-sqs:${externalTransactionId}`,
+        playerId,
+        walletId,
+        roundId: randomUUID(),
+        gameId: 'fortune-chimp',
+        kind: 'BET',
+        money: { amount: '25.00', currency: 'BRL' },
+      },
+    };
+
+    const send = (deduplicationId: string) =>
+      sqs.send(
+        new SendMessageCommand({
+          QueueUrl: environment.sqs.wagerQueueUrl,
+          MessageBody: JSON.stringify(envelope),
+          MessageGroupId: walletId,
+          MessageDeduplicationId: deduplicationId,
+        }),
+      );
+    await send(randomUUID());
+
+    const deadline = Date.now() + 8_000;
+    let processed = false;
+    while (!processed && Date.now() < deadline) {
+      const inbox = await entityManager.fork().execute<{ processed: boolean }>(
+        `select exists(
+           select 1 from inbox_messages
+            where consumer_name = 'wager-transaction-consumer-v1'
+              and message_id = ? and processed_at is not null
+         ) as processed`,
+        [messageId],
+        'get',
+      );
+      processed = inbox.processed;
+      if (!processed) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(processed).toBe(true);
+
+    await send(randomUUID());
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    const state = await entityManager.fork().execute<{
+      balance: string;
+      ledger_entries: number;
+      transactions: number;
+    }>(
+      `select w.balance::text,
+              (select count(*)::int from wallet_ledger_entries l
+                where l.wallet_id = w.id) as ledger_entries,
+              (select count(*)::int from wager_transactions t
+                where t.wallet_id = w.id) as transactions
+         from wallets w where w.id = ?`,
+      [walletId],
+      'get',
+    );
+    expect(state).toEqual({
+      balance: '75.00',
+      ledger_entries: 2,
+      transactions: 2,
+    });
+  });
+
   afterAll(async () => {
+    sqs.destroy();
     await app.close();
   });
 });
