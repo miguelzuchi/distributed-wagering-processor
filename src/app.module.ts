@@ -5,6 +5,7 @@ import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { loadEnvironment, validateEnvironment } from './config/environment.js';
 import mikroOrmConfig from './infrastructure/persistence/mikro-orm.config.js';
+import { WalletsModule } from './wallets/wallets.module.js';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import mikroOrmConfig from './infrastructure/persistence/mikro-orm.config.js';
       validate: validateEnvironment,
     }),
     MikroOrmModule.forRoot(mikroOrmConfig),
+    WalletsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
