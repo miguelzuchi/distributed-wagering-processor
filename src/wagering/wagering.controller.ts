@@ -5,6 +5,7 @@ import {
   Get,
   Headers,
   Param,
+  ParseUUIDPipe,
   Post,
   Res,
 } from '@nestjs/common';
@@ -29,14 +30,20 @@ export class WageringController {
     if (!idempotencyKey?.trim()) {
       throw new BadRequestException('Idempotency-Key header is required');
     }
-    const result = await this.wagering.submit(input, idempotencyKey);
+    const normalizedIdempotencyKey = idempotencyKey.trim();
+    if (normalizedIdempotencyKey.length > 300) {
+      throw new BadRequestException(
+        'Idempotency-Key header must not exceed 300 characters',
+      );
+    }
+    const result = await this.wagering.submit(input, normalizedIdempotencyKey);
     response.status(this.httpStatus(result));
     return result;
   }
 
   @Get(':transactionId')
   getById(
-    @Param('transactionId') transactionId: string,
+    @Param('transactionId', new ParseUUIDPipe()) transactionId: string,
   ): Promise<WagerTransactionResponse> {
     return this.wagering.getById(transactionId);
   }

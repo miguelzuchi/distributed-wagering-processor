@@ -15,6 +15,7 @@ import {
   WalletBalanceChanged,
 } from '../domain/events/wallet-events.js';
 import { Money } from '../domain/shared/money.js';
+import { InsufficientBalanceError } from '../domain/shared/domain.error.js';
 import {
   FailureCode,
   WagerTransactionKind,
@@ -22,6 +23,7 @@ import {
 } from '../domain/wagering/wager-transaction.js';
 import { LedgerDirection } from '../domain/wallet/wallet-ledger-entry.js';
 import { Wallet } from '../domain/wallet/wallet.js';
+import { withPostgresTransactionRetry } from '../infrastructure/persistence/postgres-retry.js';
 import { SubmitWagerTransactionDto } from './dto/submit-wager-transaction.dto.js';
 
 interface WalletRow {
@@ -104,7 +106,7 @@ export class WageringService {
       .update(canonicalJson(input))
       .digest('hex');
 
-    return this.entityManager.fork().transactional(async (em) => {
+    return this.transactionalWithRetry(async (em) => {
       // Serializes only equal idempotency keys, including requests targeting
       // different wallets. It is not a global financial lock.
       await em.execute('select pg_advisory_xact_lock(hashtextextended(?, 0))', [
@@ -149,7 +151,8 @@ export class WageringService {
       ): Promise<WagerTransactionResponse> => {
         if (inbox && shouldCompleteInbox) {
           await em.execute(
-            `update inbox_messages set processed_at = ?
+            `update inbox_messages
+                set processed_at = ?, status = 'PROCESSED'
               where consumer_name = ? and message_id = ?`,
             [new Date(), inbox.consumerName, inbox.messageId],
           );
@@ -324,7 +327,8 @@ export class WageringService {
         } else {
           wallet.credit(money, now);
         }
-      } catch {
+      } catch (error) {
+        if (!(error instanceof InsufficientBalanceError)) throw error;
         const failure =
           input.kind === WagerTransactionKind.Bet
             ? FailureCode.InsufficientBalance
@@ -421,6 +425,31 @@ export class WageringService {
     return this.toResponse(row, false);
   }
 
+  async recordInboxRejection(
+    inbox: InboxContext,
+    failureReason: string,
+  ): Promise<void> {
+    await this.entityManager.fork().execute(
+      `insert into inbox_messages
+        (consumer_name, message_id, payload_hash, received_at,
+         processed_at, status, failure_reason)
+       values (?, ?, ?, ?, ?, 'REJECTED', ?)
+       on conflict (consumer_name, message_id) do update
+         set processed_at = excluded.processed_at,
+             status = 'REJECTED',
+             failure_reason = excluded.failure_reason
+       where inbox_messages.payload_hash = excluded.payload_hash`,
+      [
+        inbox.consumerName,
+        inbox.messageId,
+        inbox.payloadHash,
+        inbox.receivedAt,
+        new Date(),
+        failureReason.slice(0, 200),
+      ],
+    );
+  }
+
   async getByProviderExternalId(
     providerId: string,
     externalTransactionId: string,
@@ -454,7 +483,7 @@ export class WageringService {
   }
 
   private async reprocessReference(id: string): Promise<boolean> {
-    return this.entityManager.fork().transactional(async (em) => {
+    return this.transactionalWithRetry(async (em) => {
       const pending = await em.execute<PendingRow>(
         `select id, provider_id, external_transaction_id, idempotency_key,
                 payload_hash, wallet_id, player_id, round_id, game_id, kind,
@@ -540,7 +569,8 @@ export class WageringService {
         } else {
           wallet.debit(money, now);
         }
-      } catch {
+      } catch (error) {
+        if (!(error instanceof InsufficientBalanceError)) throw error;
         await this.rejectExisting(
           em,
           pending.id,
@@ -609,6 +639,14 @@ export class WageringService {
       );
       return true;
     });
+  }
+
+  private transactionalWithRetry<T>(
+    operation: (entityManager: EntityManager) => Promise<T>,
+  ): Promise<T> {
+    return withPostgresTransactionRetry(() =>
+      this.entityManager.fork().transactional(operation),
+    );
   }
 
   private async insertPending(

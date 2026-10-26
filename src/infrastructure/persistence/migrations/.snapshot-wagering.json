@@ -25,6 +25,23 @@
           "enumItems": [],
           "mappedType": "string"
         },
+        "failure_reason": {
+          "name": "failure_reason",
+          "type": "varchar(200)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 200,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
         "message_id": {
           "name": "message_id",
           "type": "varchar(200)",
@@ -92,6 +109,27 @@
           "collation": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "status": {
+          "name": "status",
+          "type": "varchar(16)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": "'PENDING'",
+          "comment": null,
+          "collation": null,
+          "enumItems": [
+            "PENDING",
+            "PROCESSED",
+            "REJECTED"
+          ],
+          "mappedType": "enum"
         }
       },
       "indexes": [
@@ -113,6 +151,18 @@
           "expression": "payload_hash ~ '^[0-9a-f]{64}$'::text",
           "definition": "CHECK ((payload_hash ~ '^[0-9a-f]{64}$'::text))",
           "columnName": "payload_hash"
+        },
+        {
+          "name": "inbox_messages_status_valid",
+          "expression": "\"status\" in ('PENDING', 'PROCESSED', 'REJECTED')",
+          "definition": "check (\"status\" in ('PENDING', 'PROCESSED', 'REJECTED'))",
+          "columnName": "status"
+        },
+        {
+          "name": "inbox_messages_terminal_shape",
+          "expression": "((status = 'PENDING'::text) AND (processed_at IS NULL) AND (failure_reason IS NULL)) OR ((status = 'PROCESSED'::text) AND (processed_at IS NOT NULL) AND (failure_reason IS NULL)) OR ((status = 'REJECTED'::text) AND (processed_at IS NOT NULL) AND (failure_reason IS NOT NULL))",
+          "definition": "CHECK (((((status)::text = 'PENDING'::text) AND (processed_at IS NULL) AND (failure_reason IS NULL)) OR (((status)::text = 'PROCESSED'::text) AND (processed_at IS NOT NULL) AND (failure_reason IS NULL)) OR (((status)::text = 'REJECTED'::text) AND (processed_at IS NOT NULL) AND (failure_reason IS NOT NULL))))",
+          "columnName": "failure_reason"
         }
       ],
       "triggers": [],
@@ -156,6 +206,40 @@
           "collation": null,
           "enumItems": [],
           "mappedType": "integer"
+        },
+        "claim_token": {
+          "name": "claim_token",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "claim_until": {
+          "name": "claim_until",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "datetime"
         },
         "event_type": {
           "name": "event_type",
@@ -290,6 +374,12 @@
           "expression": "attempts >= 0",
           "definition": "CHECK ((attempts >= 0))",
           "columnName": "attempts"
+        },
+        {
+          "name": "outbox_messages_claim_shape",
+          "expression": "((claim_token IS NULL) AND (claim_until IS NULL)) OR ((claim_token IS NOT NULL) AND (claim_until IS NOT NULL))",
+          "definition": "CHECK ((((claim_token IS NULL) AND (claim_until IS NULL)) OR ((claim_token IS NOT NULL) AND (claim_until IS NOT NULL))))",
+          "columnName": "claim_token"
         },
         {
           "name": "outbox_messages_payload_object",

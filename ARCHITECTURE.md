@@ -46,13 +46,13 @@ A migration inicial foi validada em PostgreSQL 16 real nos dois sentidos (`up`, 
 
 O LocalStack cria duas filas FIFO durante o startup. A fila principal usa a DLQ como redrive policy com `maxReceiveCount` igual a cinco. Deduplicação do broker não substituirá inbox nem idempotência persistente.
 
-O consumidor reutiliza `WageringService.submit`, passando um contexto de inbox. Inbox, transação financeira, wallet, ledger e outbox são confirmados na mesma transação PostgreSQL. O ACK (`DeleteMessage`) ocorre somente depois que o caso de uso retorna, portanto depois do commit.
+O consumidor reutiliza `WageringService.submit`, passando um contexto de inbox. Inbox, transação financeira, wallet, ledger e outbox são confirmados na mesma transação PostgreSQL. O ACK (`DeleteMessage`) ocorre somente depois que o caso de uso retorna, portanto depois do commit. Erros de negócio terminais são persistidos na inbox com status `REJECTED` antes do ACK; se essa auditoria falhar, a mensagem permanece sem ACK.
 
 Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e mensagens inválidas ficam sem ACK; a visibility timeout permite redelivery e a redrive policy encaminha à DLQ após cinco recebimentos. `OnModuleDestroy` interrompe novos polls e destrói o cliente SQS.
 
 Um teste end-to-end envia uma mensagem FIFO ao LocalStack, espera a inbox processada e reenvia o mesmo `messageId`, comprovando um único débito.
 
-Eventos de integração são publicados em `wager-events.fifo`. Publishers concorrentes reivindicam lotes com `FOR UPDATE SKIP LOCKED`; sucesso grava `published_at`, enquanto falha incrementa `attempts` e agenda backoff exponencial limitado a 60 segundos. O envio ocorre antes da marcação no banco, portanto uma queda nesse intervalo pode duplicar a publicação, mas nunca perder um evento. `eventId` é usado como deduplication ID e também permite deduplicação persistente no consumidor.
+Eventos de integração são publicados em `wager-events.fifo`. Publishers concorrentes reivindicam lotes com `FOR UPDATE SKIP LOCKED` e um lease persistente. A transação termina antes do I/O com SQS; assim, lentidão de rede não mantém locks nem conexões transacionais ocupadas. Claims abandonados expiram e podem ser retomados. Sucesso grava `published_at`, enquanto falha incrementa `attempts` e agenda backoff exponencial limitado a 60 segundos. O envio ocorre antes da marcação no banco, portanto uma queda nesse intervalo pode duplicar a publicação, mas nunca perder um evento. `eventId` é usado como deduplication ID e também permite deduplicação persistente no consumidor.
 
 Referências pendentes são examinadas em lotes de 25. Cada item é reprocessado em transação própria, com locks da transação e da wallet. O backoff é exponencial e limitado a 60 segundos; após oito tentativas sem referência, a transação é rejeitada com `REFERENCE_NOT_FOUND`. O teste fora de ordem entrega o REFUND antes da BET e comprova a aplicação posterior automática.
 
@@ -62,7 +62,7 @@ A primeira versão terá um ponto de extensão para um Identity Provider OIDC, m
 
 ## Concorrência
 
-A unidade de serialização financeira é a wallet. O caso de uso abre uma única transação SQL e obtém `SELECT ... FOR UPDATE` da wallet antes de validar saldo, resolver a direção e escrever wallet, transaction, ledger e outbox. Locks de wallets diferentes não se bloqueiam. Deadlocks e falhas transitórias terão retry limitado com jitter; erros de negócio não serão repetidos.
+A unidade de serialização financeira é a wallet. O caso de uso abre uma única transação SQL e obtém `SELECT ... FOR UPDATE` da wallet antes de validar saldo, resolver a direção e escrever wallet, transaction, ledger e outbox. Locks de wallets diferentes não se bloqueiam. Deadlocks (`40P01`) e falhas de serialização (`40001`) têm até três tentativas com backoff exponencial e jitter; erros de negócio não são repetidos.
 
 Antes do lock da wallet, `pg_advisory_xact_lock(hashtextextended(idempotencyKey, 0))` serializa apenas submissões com a mesma chave, inclusive se payloads conflitantes apontarem para wallets diferentes. O lock é transacional, liberado automaticamente, e não constitui lock financeiro global.
 
@@ -82,6 +82,6 @@ A reconciliação soma créditos e débitos diretamente do ledger e compara com 
 
 ## Decisões pendentes
 
-- Taxonomia de failure codes.
-- Backoff e claim concorrente da outbox.
-- Retry limitado para deadlock/serialization failure.
+- Política de retenção para inbox, outbox publicada e transações antigas.
+- Métricas, tracing e alertas operacionais.
+- Estratégia de autenticação OIDC.

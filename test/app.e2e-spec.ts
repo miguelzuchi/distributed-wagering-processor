@@ -125,6 +125,28 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       .expect(400);
   });
 
+  it('rejects malformed identifiers and oversized idempotency keys as 400', async () => {
+    await request(app.getHttpServer()).get('/wallets/not-a-uuid').expect(400);
+    await request(app.getHttpServer())
+      .get('/wagering/transactions/not-a-uuid')
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', 'x'.repeat(301))
+      .send({
+        providerId: 'provider-validation',
+        externalTransactionId: randomUUID(),
+        playerId: randomUUID(),
+        walletId: randomUUID(),
+        roundId: randomUUID(),
+        gameId: 'fortune-chimp',
+        kind: 'BET',
+        money: { amount: '10.00', currency: 'BRL' },
+      })
+      .expect(400);
+  });
+
   it('debits exactly once when the same bet arrives 50 times in parallel', async () => {
     const playerId = randomUUID();
     const wallet = await request(app.getHttpServer())
@@ -488,6 +510,56 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       balance: '75.00',
       ledger_entries: 2,
       transactions: 2,
+    });
+  });
+
+  it('audits a terminal SQS business rejection before acknowledging it', async () => {
+    const messageId = randomUUID();
+    const walletId = randomUUID();
+    const externalTransactionId = randomUUID();
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: environment.sqs.wagerQueueUrl,
+        MessageGroupId: walletId,
+        MessageDeduplicationId: randomUUID(),
+        MessageBody: JSON.stringify({
+          messageId,
+          type: 'WagerTransactionRequested',
+          occurredAt: new Date().toISOString(),
+          data: {
+            providerId: 'provider-terminal-rejection',
+            externalTransactionId,
+            idempotencyKey: `provider-terminal-rejection:${externalTransactionId}`,
+            playerId: randomUUID(),
+            walletId,
+            roundId: randomUUID(),
+            gameId: 'fortune-chimp',
+            kind: 'BET',
+            money: { amount: '10.00', currency: 'BRL' },
+          },
+        }),
+      }),
+    );
+
+    const deadline = Date.now() + 8_000;
+    let rejected: { status: string; failure_reason: string } | undefined;
+    while (!rejected && Date.now() < deadline) {
+      rejected = await entityManager.fork().execute<{
+        status: string;
+        failure_reason: string;
+      }>(
+        `select status, failure_reason from inbox_messages
+          where consumer_name = 'wager-transaction-consumer-v1'
+            and message_id = ? and processed_at is not null`,
+        [messageId],
+        'get',
+      );
+      if (!rejected) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    expect(rejected).toEqual({
+      status: 'REJECTED',
+      failure_reason: 'HTTP_404_NotFoundException',
     });
   });
 

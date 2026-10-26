@@ -17,7 +17,7 @@ import { validate } from 'class-validator';
 import { canonicalJson } from '../application/canonical-json.js';
 import { loadEnvironment } from '../config/environment.js';
 import { SubmitWagerTransactionDto } from '../wagering/dto/submit-wager-transaction.dto.js';
-import { WageringService } from '../wagering/wagering.service.js';
+import { InboxContext, WageringService } from '../wagering/wagering.service.js';
 
 interface WagerEnvelope {
   messageId: string;
@@ -87,6 +87,7 @@ export class SqsWagerConsumer
 
   private async handle(message: Message): Promise<void> {
     if (!message.Body || !message.ReceiptHandle) return;
+    let inbox: InboxContext | undefined;
     try {
       const envelope = JSON.parse(message.Body) as WagerEnvelope;
       if (
@@ -106,16 +107,31 @@ export class SqsWagerConsumer
       const payloadHash = createHash('sha256')
         .update(canonicalJson(envelope))
         .digest('hex');
-      await this.wagering.submit(input, envelope.data.idempotencyKey, {
+      inbox = {
         consumerName: 'wager-transaction-consumer-v1',
         messageId: envelope.messageId,
         payloadHash,
         receivedAt: new Date(),
-      });
+      };
+      await this.wagering.submit(input, envelope.data.idempotencyKey, inbox);
       await this.ack(message.ReceiptHandle);
     } catch (error) {
       if (error instanceof HttpException && error.getStatus() < 500) {
-        await this.ack(message.ReceiptHandle);
+        try {
+          if (inbox) {
+            await this.wagering.recordInboxRejection(
+              inbox,
+              `HTTP_${error.getStatus()}_${error.name}`,
+            );
+          }
+          await this.ack(message.ReceiptHandle);
+        } catch (recordError) {
+          this.logger.warn({
+            event: 'sqs_terminal_failure_record_failed',
+            messageId: message.MessageId,
+            error: this.errorName(recordError),
+          });
+        }
         return;
       }
       this.logger.warn({

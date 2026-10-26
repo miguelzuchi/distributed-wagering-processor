@@ -15,6 +15,12 @@ export const OutboxMessageEntity = defineEntity({
       .columnType('timestamptz')
       .fieldName('next_attempt_at')
       .nullable(),
+    claimToken: p.uuid().fieldName('claim_token').nullable(),
+    claimUntil: p
+      .datetime()
+      .columnType('timestamptz')
+      .fieldName('claim_until')
+      .nullable(),
     publishedAt: p
       .datetime()
       .columnType('timestamptz')
