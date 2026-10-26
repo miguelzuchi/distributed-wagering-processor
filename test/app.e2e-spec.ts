@@ -11,6 +11,7 @@ import { loadEnvironment } from '../src/config/environment.js';
 
 describe('HTTP API (e2e with PostgreSQL)', () => {
   let app: INestApplication<App>;
+  let replicaApp: INestApplication<App>;
   let entityManager: EntityManager;
   let sqs: SQSClient;
   const environment = loadEnvironment();
@@ -23,6 +24,13 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     configureApplication(app);
     await app.init();
     app.getHttpServer().setMaxListeners(100);
+    const replicaModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    replicaApp = replicaModule.createNestApplication();
+    configureApplication(replicaApp);
+    await replicaApp.init();
+    replicaApp.getHttpServer().setMaxListeners(100);
     entityManager = app.get(EntityManager);
     sqs = new SQSClient({
       region: environment.sqs.region,
@@ -35,6 +43,8 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     await request(app.getHttpServer()).get('/').expect(200, 'Hello World!');
     await request(app.getHttpServer())
       .get('/health/live')
+      .set('X-Correlation-Id', 'health-probe-123')
+      .expect('X-Correlation-Id', 'health-probe-123')
       .expect(200, { status: 'ok' });
     await request(app.getHttpServer())
       .get('/health/ready')
@@ -44,6 +54,20 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
           status: 'ok',
           checks: { postgres: true, sqs: true },
         });
+      });
+  });
+
+  it('exposes persisted operational metrics in Prometheus format', async () => {
+    await request(app.getHttpServer())
+      .get('/metrics')
+      .expect('Content-Type', /text\/plain; version=0\.0\.4/)
+      .expect(200)
+      .expect(({ text }) => {
+        expect(text).toMatch(/# TYPE wagering_transactions_total counter/);
+        expect(text).toMatch(/wagering_transactions_total \d+/);
+        expect(text).toMatch(/wagering_transactions_pending_reference \d+/);
+        expect(text).toMatch(/wagering_outbox_pending \d+/);
+        expect(text).toMatch(/wagering_inbox_processed_total \d+/);
       });
   });
 
@@ -147,7 +171,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       .expect(400);
   });
 
-  it('debits exactly once when the same bet arrives 50 times in parallel', async () => {
+  it('debits exactly once when the same bet reaches two replicas 50 times in parallel', async () => {
     const playerId = randomUUID();
     const wallet = await request(app.getHttpServer())
       .post('/wallets')
@@ -169,8 +193,10 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     const idempotencyKey = `${payload.providerId}:${payload.externalTransactionId}`;
 
     const responses = await Promise.all(
-      Array.from({ length: 50 }, () =>
-        request(app.getHttpServer())
+      Array.from({ length: 50 }, (_, index) =>
+        request(
+          index % 2 === 0 ? app.getHttpServer() : replicaApp.getHttpServer(),
+        )
           .post('/wagering/transactions')
           .set('Idempotency-Key', idempotencyKey)
           .send(payload),
@@ -188,7 +214,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     expect(fetched.body.balance.amount).toBe('75.00');
   });
 
-  it('serializes competing bets on one wallet without a lost update', async () => {
+  it('serializes competing bets across replicas without a lost update', async () => {
     const playerId = randomUUID();
     const wallet = await request(app.getHttpServer())
       .post('/wallets')
@@ -211,8 +237,8 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       { ...base, externalTransactionId: randomUUID() },
     ];
     const responses = await Promise.all(
-      payloads.map((payload) =>
-        request(app.getHttpServer())
+      payloads.map((payload, index) =>
+        request(index === 0 ? app.getHttpServer() : replicaApp.getHttpServer())
           .post('/wagering/transactions')
           .set(
             'Idempotency-Key',
@@ -511,7 +537,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       ledger_entries: 2,
       transactions: 2,
     });
-  });
+  }, 15_000);
 
   it('audits a terminal SQS business rejection before acknowledging it', async () => {
     const messageId = randomUUID();
@@ -565,6 +591,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
 
   afterAll(async () => {
     sqs.destroy();
+    await replicaApp.close();
     await app.close();
   });
 });

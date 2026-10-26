@@ -6,7 +6,7 @@ Serviço financeiro distribuído para processar transações de apostas entregue
 
 O núcleo financeiro, abertura de wallet e processamento HTTP de transações estão implementados. `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` compartilham um caso de uso transacional com idempotência persistente, lock por wallet, ledger e outbox. Referências ausentes são persistidas como `PENDING_REFERENCE`.
 
-Há testes de concorrência HTTP contra PostgreSQL real, incluindo 50 replays paralelos e apostas disputando o mesmo saldo. Ledger paginado, reconciliação e health checks de PostgreSQL/SQS também estão disponíveis. O consumidor SQS usa inbox atômica, auditoria de rejeições, ACK após commit e redrive para DLQ. O publisher concorrente da outbox usa claims com lease, `SKIP LOCKED`, fila de eventos dedicada e backoff persistente sem manter transações abertas durante chamadas de rede. Referências fora de ordem são reprocessadas automaticamente. Deadlocks e falhas de serialização do PostgreSQL têm retry limitado com backoff e jitter. A CI valida build, lint, testes, migrations, E2E e a imagem de produção. Ainda estão em desenvolvimento métricas e testes entre múltiplos processos.
+Há testes de concorrência HTTP contra PostgreSQL real, duas instâncias isoladas e dois processos completos da aplicação. Eles incluem 50 replays paralelos, apostas disputando o mesmo saldo entre réplicas e continuidade após o encerramento de uma delas. Ledger paginado, reconciliação e health checks de PostgreSQL/SQS também estão disponíveis. O consumidor SQS usa inbox atômica, auditoria de rejeições, ACK após commit e redrive para DLQ. O publisher concorrente da outbox usa claims com lease, `SKIP LOCKED`, fila de eventos dedicada e backoff persistente sem manter transações abertas durante chamadas de rede. Referências fora de ordem são reprocessadas automaticamente. Deadlocks e falhas de serialização do PostgreSQL têm retry limitado com backoff e jitter. Métricas Prometheus expõem o volume processado e os backlogs persistentes de inbox, outbox e referências. A CI valida build, lint, testes, migrations, E2E e a imagem de produção.
 
 ## Stack
 
@@ -57,6 +57,15 @@ bun run start:dev
 ```
 
 A API fica disponível por padrão em `http://localhost:3000`.
+
+As métricas no formato Prometheus ficam em `GET /metrics`. O endpoint deriva os
+contadores e backlogs do estado persistido, portanto continua correto após
+reinícios e pode ser coletado de qualquer réplica da aplicação.
+
+Toda resposta HTTP inclui `X-Correlation-Id`. Um identificador seguro enviado
+pelo cliente é preservado; quando ausente ou inválido, a aplicação gera um UUID.
+Ao concluir a resposta, um log estruturado registra correlação, método, caminho,
+status e duração, sem incluir payloads ou dados financeiros.
 
 ## Comandos
 

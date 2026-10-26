@@ -83,5 +83,5 @@ A reconciliação soma créditos e débitos diretamente do ledger e compara com 
 ## Decisões pendentes
 
 - Política de retenção para inbox, outbox publicada e transações antigas.
-- Métricas, tracing e alertas operacionais.
+- Tracing distribuído e alertas operacionais.
 - Estratégia de autenticação OIDC.

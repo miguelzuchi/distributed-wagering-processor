@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { AppController } from './app.controller.js';
@@ -9,6 +9,8 @@ import { WalletsModule } from './wallets/wallets.module.js';
 import { WageringModule } from './wagering/wagering.module.js';
 import { HealthModule } from './health/health.module.js';
 import { MessagingModule } from './messaging/messaging.module.js';
+import { MetricsModule } from './metrics/metrics.module.js';
+import { HttpLoggingMiddleware } from './observability/http-logging.middleware.js';
 
 @Module({
   imports: [
@@ -23,8 +25,13 @@ import { MessagingModule } from './messaging/messaging.module.js';
     WageringModule,
     HealthModule,
     MessagingModule,
+    MetricsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(HttpLoggingMiddleware).forRoutes('*');
+  }
+}
