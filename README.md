@@ -98,6 +98,10 @@ O arquivo `compose.yaml` fornece:
 - DLQ FIFO `wager-transactions-dlq.fifo`;
 - redrive automático para a DLQ após cinco recebimentos.
 
+O healthcheck do LocalStack só considera o serviço pronto depois que as três
+filas obrigatórias existem, evitando que migrations e testes E2E comecem
+durante a execução dos hooks de inicialização.
+
 O LocalStack está fixado na versão comunitária `4.4.0`. Versões publicadas a partir de março de 2026 passaram a exigir autenticação e uma licença, inclusive ao iniciar o container.
 
 As credenciais de desenvolvimento existem apenas para o ambiente local e estão documentadas em `.env.example`. O arquivo `.env` real não é versionado.

@@ -31,6 +31,12 @@ jobs:
       - name: Start integration infrastructure
         run: bun run infra:up
 
+      - name: Verify integration queues
+        run: |
+          docker compose exec -T localstack awslocal sqs get-queue-url --queue-name wager-transactions.fifo
+          docker compose exec -T localstack awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo
+          docker compose exec -T localstack awslocal sqs get-queue-url --queue-name wager-events.fifo
+
       - name: Apply database migrations
         run: bun run db:migrate
 
