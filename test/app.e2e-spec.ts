@@ -3,6 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { EntityManager } from '@mikro-orm/postgresql';
 import {
+  DeleteMessageCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -21,6 +22,9 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
   const environment = loadEnvironment();
 
   beforeAll(async () => {
+    if (environment.nodeEnv !== 'test') {
+      throw new Error('E2E tests require NODE_ENV=test');
+    }
     const moduleFixture = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
@@ -693,34 +697,35 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       }),
     );
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 30_000;
     let found = false;
     while (!found && Date.now() < deadline) {
-      // Receiving with zero visibility accelerates the broker's receive count
-      // deterministically while the application consumers exercise the same
-      // no-ACK path concurrently.
-      await sqs.send(
-        new ReceiveMessageCommand({
-          QueueUrl: environment.sqs.wagerQueueUrl,
-          MaxNumberOfMessages: 1,
-          WaitTimeSeconds: 0,
-          VisibilityTimeout: 0,
-        }),
-      );
       const received = await sqs.send(
         new ReceiveMessageCommand({
           QueueUrl: environment.sqs.wagerDlqUrl,
           MaxNumberOfMessages: 10,
           WaitTimeSeconds: 1,
-          VisibilityTimeout: 0,
+          VisibilityTimeout: 5,
         }),
       );
       found = (received.Messages ?? []).some((message) =>
         message.Body?.includes(marker),
       );
+      await Promise.all(
+        (received.Messages ?? [])
+          .filter((message) => message.ReceiptHandle)
+          .map((message) =>
+            sqs.send(
+              new DeleteMessageCommand({
+                QueueUrl: environment.sqs.wagerDlqUrl,
+                ReceiptHandle: message.ReceiptHandle!,
+              }),
+            ),
+          ),
+      );
     }
     expect(found).toBe(true);
-  }, 15_000);
+  }, 35_000);
 
   it('rejects an exhausted pending reference without creating ledger', async () => {
     const playerId = randomUUID();

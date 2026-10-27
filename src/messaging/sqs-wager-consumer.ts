@@ -19,6 +19,7 @@ import { canonicalJson } from '../application/canonical-json.js';
 import { loadEnvironment } from '../config/environment.js';
 import { SubmitWagerTransactionDto } from '../wagering/dto/submit-wager-transaction.dto.js';
 import { InboxContext, WageringService } from '../wagering/wagering.service.js';
+import { sqsRetryVisibilitySeconds } from './sqs-retry-policy.js';
 
 interface WagerEnvelope {
   messageId: string;
@@ -172,7 +173,47 @@ export class SqsWagerConsumer
         receiveCount: message.Attributes?.ApproximateReceiveCount,
         error: this.errorName(error),
       });
-      // No ACK: SQS restores visibility and applies its redrive policy.
+      await this.scheduleRetry(message);
+    }
+  }
+
+  private async scheduleRetry(message: Message): Promise<void> {
+    if (!message.ReceiptHandle) return;
+
+    const receiveCount = Number.parseInt(
+      message.Attributes?.ApproximateReceiveCount ?? '1',
+      10,
+    );
+    const visibilityTimeout = sqsRetryVisibilitySeconds(
+      Number.isFinite(receiveCount) ? receiveCount : 1,
+      this.environment.nodeEnv === 'test',
+    );
+    const abortController = new AbortController();
+    const requestTimeout = setTimeout(
+      () => abortController.abort(),
+      this.environment.nodeEnv === 'test' ? 500 : 5_000,
+    );
+    requestTimeout.unref();
+
+    try {
+      await this.sqs.send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: this.environment.sqs.wagerQueueUrl,
+          ReceiptHandle: message.ReceiptHandle,
+          VisibilityTimeout: visibilityTimeout,
+        }),
+        { abortSignal: abortController.signal },
+      );
+    } catch (error) {
+      this.logger.warn({
+        event: 'sqs_retry_schedule_failed',
+        messageId: message.MessageId,
+        receiveCount,
+        error: this.errorName(error),
+      });
+      // The original visibility timeout remains the safe fallback.
+    } finally {
+      clearTimeout(requestTimeout);
     }
   }
 

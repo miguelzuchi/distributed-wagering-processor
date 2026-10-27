@@ -9,5 +9,8 @@ export default defineConfig({
     root: './',
     include: ['**/*.e2e-spec.ts'],
     fileParallelism: false,
+    env: {
+      NODE_ENV: 'test',
+    },
   },
 });

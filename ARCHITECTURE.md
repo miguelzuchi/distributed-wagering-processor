@@ -51,7 +51,7 @@ O LocalStack cria três filas FIFO durante o startup: entrada, DLQ e eventos. A 
 
 O consumidor reutiliza `WageringService.submit`, passando um contexto de inbox. Inbox, transação financeira, wallet, ledger e outbox são confirmados na mesma transação PostgreSQL. O ACK (`DeleteMessage`) ocorre somente depois que o caso de uso retorna, portanto depois do commit. Erros de negócio terminais são persistidos na inbox com status `REJECTED` antes do ACK; se essa auditoria falhar, a mensagem permanece sem ACK.
 
-Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e mensagens inválidas ficam sem ACK; a visibility timeout permite redelivery e a redrive policy encaminha à DLQ após cinco recebimentos. No shutdown, novos polls são interrompidos, mensagens em andamento recebem até dez segundos para terminar e as restantes têm a visibilidade devolvida antes da destruição do cliente.
+Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e mensagens inválidas ficam sem ACK; o consumidor agenda redelivery com visibility timeout exponencial de 5, 10, 20 e 40 segundos e libera a mensagem imediatamente no quinto recebimento, quando a redrive policy a encaminha à DLQ. No shutdown, novos polls são interrompidos, mensagens em andamento recebem até dez segundos para terminar e as restantes têm a visibilidade devolvida antes da destruição do cliente.
 
 Os testes end-to-end cobrem inbox duplicada, redrive real, três processos e crash com `SIGKILL` depois do commit e antes do ACK, comprovando redelivery sem débito duplicado.
 
