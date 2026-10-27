@@ -15,8 +15,5 @@ export function sqsRetryVisibilitySeconds(
     ? TEST_BASE_VISIBILITY_SECONDS
     : PRODUCTION_BASE_VISIBILITY_SECONDS;
 
-  return Math.min(
-    base * 2 ** (normalizedCount - 1),
-    MAX_VISIBILITY_SECONDS,
-  );
+  return Math.min(base * 2 ** (normalizedCount - 1), MAX_VISIBILITY_SECONDS);
 }

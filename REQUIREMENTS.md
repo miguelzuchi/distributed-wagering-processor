@@ -13,10 +13,11 @@ automatizadas do projeto.
 | Idempotência HTTP | advisory lock, hash e UNIQUE | 50 requests paralelas |
 | Payload divergente | hash persistente | unidade e HTTP `409` |
 | Concorrência | `FOR UPDATE` por wallet | duas BETs de 80 sobre 100 |
+| Paralelismo entre wallets | lock restrito à wallet | 12 wallets em duas réplicas |
 | Múltiplas instâncias | coordenação pelo PostgreSQL | três processos reais |
 | Inbox | PK consumer/message na transação | SQS real e redelivery |
 | ACK após commit | ACK fora da transação SQL | crash commit/ACK com SIGKILL |
-| Retry e DLQ | ausência de ACK + redrive | LocalStack real até DLQ |
+| Retry e DLQ | backoff/redrive transitório; publicação segura para erro permanente | LocalStack real até DLQ |
 | Graceful shutdown | drain + visibility zero | implementação e crash recovery |
 | Transactional outbox | insert no commit financeiro | auditoria E2E no banco |
 | Publishers concorrentes | lease + `SKIP LOCKED` | duas apps + lease abandonado |
@@ -27,8 +28,9 @@ automatizadas do projeto.
 | Reconciliação | soma independente do ledger | E2E de reconciliação |
 | Paginação | cursor `(created_at,id)` | E2E do ledger |
 | Health | live isolado, ready DB/SQS | E2E de health |
-| Observabilidade | logs JSON e `/metrics` | testes dedicados |
+| Observabilidade | logs JSON e `/metrics`, incluindo retry, DLQ e lock conflicts | testes dedicados |
 | Migrations | up/down versionados | PostgreSQL real down/up |
+| Reinicialização | estado persistido independente do processo | SIGKILL, nova instância e reconciliação |
 
 ## Falhas demonstradas
 

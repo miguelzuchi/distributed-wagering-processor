@@ -19,6 +19,9 @@ describe('MetricsController', () => {
         transactions_processed: '9',
         transactions_failed: '0',
         transactions_pending: '0',
+        sqs_retries_total: '4',
+        sqs_dlq_messages_total: '2',
+        lock_conflicts_total: '3',
       },
     ]);
     const entityManager = { fork: () => ({ execute }) };
@@ -37,6 +40,9 @@ describe('MetricsController', () => {
     expect(result).toContain('wagering_idempotent_replays_total 7');
     expect(result).toContain('wagering_outbox_lag_seconds 1.5');
     expect(result).toContain('wagering_transactions_processed 9');
+    expect(result).toContain('wagering_sqs_retries_total 4');
+    expect(result).toContain('wagering_sqs_dlq_messages_total 2');
+    expect(result).toContain('wagering_lock_conflicts_total 3');
     expect(execute).toHaveBeenCalledOnce();
   });
 

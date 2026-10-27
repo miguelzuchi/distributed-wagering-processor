@@ -15,6 +15,9 @@ interface MetricsSnapshot {
   transactions_processed: string | number;
   transactions_failed: string | number;
   transactions_pending: string | number;
+  sqs_retries_total: string | number;
+  sqs_dlq_messages_total: string | number;
+  lock_conflicts_total: string | number;
 }
 
 @Controller('metrics')
@@ -52,7 +55,13 @@ export class MetricsController {
       (select count(*) from wager_transactions where status = 'FAILED')
         as transactions_failed,
       (select count(*) from wager_transactions where status = 'PENDING')
-        as transactions_pending`);
+        as transactions_pending,
+      coalesce((select value from operational_counters
+        where name = 'sqs_retries_total'), 0) as sqs_retries_total,
+      coalesce((select value from operational_counters
+        where name = 'sqs_dlq_messages_total'), 0) as sqs_dlq_messages_total,
+      coalesce((select value from operational_counters
+        where name = 'lock_conflicts_total'), 0) as lock_conflicts_total`);
 
     const metrics: Array<[string, string, number]> = [
       [
@@ -119,6 +128,21 @@ export class MetricsController {
         'wagering_inbox_rejected_total',
         'SQS messages rejected permanently.',
         Number(snapshot?.inbox_rejected_total ?? 0),
+      ],
+      [
+        'wagering_sqs_retries_total',
+        'SQS message processing retries scheduled.',
+        Number(snapshot?.sqs_retries_total ?? 0),
+      ],
+      [
+        'wagering_sqs_dlq_messages_total',
+        'SQS messages sent or redriven to the DLQ.',
+        Number(snapshot?.sqs_dlq_messages_total ?? 0),
+      ],
+      [
+        'wagering_lock_conflicts_total',
+        'PostgreSQL deadlock or serialization conflicts retried.',
+        Number(snapshot?.lock_conflicts_total ?? 0),
       ],
     ];
 

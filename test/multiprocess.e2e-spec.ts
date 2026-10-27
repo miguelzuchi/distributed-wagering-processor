@@ -185,8 +185,7 @@ describe('multi-process deployment', () => {
     });
     await sqs.send(
       new SendMessageCommand({
-        QueueUrl:
-          'http://localhost:4566/000000000000/wager-transactions.fifo',
+        QueueUrl: 'http://localhost:4566/000000000000/wager-transactions.fifo',
         MessageGroupId: wallet.id,
         MessageDeduplicationId: randomUUID(),
         MessageBody: JSON.stringify({
@@ -226,6 +225,18 @@ describe('multi-process deployment', () => {
     const state = await fetch(`${replacement.baseUrl}/wallets/${wallet.id}`);
     const body = (await state.json()) as { balance: { amount: string } };
     expect(body.balance.amount).toBe('75.00');
+    const reconciliation = await fetch(
+      `${replacement.baseUrl}/wallets/${wallet.id}/reconciliation`,
+      { method: 'POST' },
+    );
+    expect(reconciliation.status).toBe(201);
+    expect(await reconciliation.json()).toMatchObject({
+      storedBalance: { amount: '75.00', currency: 'BRL' },
+      calculatedBalance: { amount: '75.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 2,
+    });
     sqs.destroy();
   }, 30_000);
 });

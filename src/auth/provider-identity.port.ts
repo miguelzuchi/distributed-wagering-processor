@@ -6,5 +6,7 @@ export interface ProviderIdentity {
 }
 
 export abstract class ProviderIdentityPort {
-  abstract resolve(context: ExecutionContext): Promise<ProviderIdentity | undefined>;
+  abstract resolve(
+    context: ExecutionContext,
+  ): Promise<ProviderIdentity | undefined>;
 }

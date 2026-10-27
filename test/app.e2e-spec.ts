@@ -4,6 +4,7 @@ import { Test } from '@nestjs/testing';
 import { EntityManager } from '@mikro-orm/postgresql';
 import {
   DeleteMessageCommand,
+  PurgeQueueCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -45,10 +46,19 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       endpoint: environment.sqs.endpoint,
       credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
     });
+    await Promise.all([
+      sqs.send(
+        new PurgeQueueCommand({ QueueUrl: environment.sqs.wagerQueueUrl }),
+      ),
+      sqs.send(
+        new PurgeQueueCommand({ QueueUrl: environment.sqs.wagerDlqUrl }),
+      ),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
   });
 
   it('reports the process as available', async () => {
-    await request(app.getHttpServer()).get('/').expect(200, 'Hello World!');
+    await request(app.getHttpServer()).get('/').expect(404);
     await request(app.getHttpServer())
       .get('/health/live')
       .set('X-Correlation-Id', 'health-probe-123')
@@ -275,6 +285,65 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
         [wallet.body.id],
       );
     expect(ledger[0]?.entries).toBe('2');
+  });
+
+  it('processes different wallets concurrently without cross-wallet locking', async () => {
+    const providerId = `provider-distinct-wallets-${randomUUID()}`;
+    const wallets = await Promise.all(
+      Array.from({ length: 12 }, async () => {
+        const playerId = randomUUID();
+        const response = await request(app.getHttpServer())
+          .post('/wallets')
+          .send({
+            playerId,
+            initialBalance: { amount: '100.00', currency: 'BRL' },
+          })
+          .expect(201);
+        return { playerId, walletId: response.body.id as string };
+      }),
+    );
+
+    const responses = await Promise.all(
+      wallets.map(({ playerId, walletId }, index) => {
+        const externalTransactionId = randomUUID();
+        return request(
+          index % 2 === 0 ? app.getHttpServer() : replicaApp.getHttpServer(),
+        )
+          .post('/wagering/transactions')
+          .set('Idempotency-Key', `${providerId}:${externalTransactionId}`)
+          .send({
+            providerId,
+            externalTransactionId,
+            playerId,
+            walletId,
+            roundId: randomUUID(),
+            gameId: 'fortune-chimp',
+            kind: 'BET',
+            money: { amount: '25.00', currency: 'BRL' },
+          });
+      }),
+    );
+
+    expect(responses.every(({ status }) => status === 201)).toBe(true);
+    const persisted = await entityManager
+      .fork()
+      .execute<Array<{ id: string; balance: string; debit_entries: number }>>(
+        `select w.id, w.balance::text as balance,
+              count(l.id) filter (where l.direction = 'DEBIT')::int as debit_entries
+         from wallets w
+         join wager_transactions t on t.wallet_id = w.id
+           and t.provider_id = ?
+         left join wallet_ledger_entries l on l.transaction_id = t.id
+        group by w.id, w.balance`,
+        [providerId],
+      );
+    expect(persisted).toHaveLength(wallets.length);
+    expect(
+      persisted.every(
+        ({ balance, debit_entries }) =>
+          balance === '75.00' && debit_entries === 1,
+      ),
+    ).toBe(true);
   });
 
   it('refunds a processed bet once and replays the original response', async () => {
@@ -641,14 +710,22 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     const betRound = randomUUID();
     const bet = submit('BET', '40.00', betRound);
     await bet.response.expect(201);
-    await submit('ROLLBACK', '40.00', betRound, bet.externalTransactionId)
-      .response.expect(201);
+    await submit(
+      'ROLLBACK',
+      '40.00',
+      betRound,
+      bet.externalTransactionId,
+    ).response.expect(201);
 
     const winRound = randomUUID();
     const win = submit('WIN', '20.00', winRound);
     await win.response.expect(201);
-    await submit('ROLLBACK', '20.00', winRound, win.externalTransactionId)
-      .response.expect(201);
+    await submit(
+      'ROLLBACK',
+      '20.00',
+      winRound,
+      win.externalTransactionId,
+    ).response.expect(201);
 
     const refundRound = randomUUID();
     const refundableBet = submit('BET', '10.00', refundRound);
@@ -660,8 +737,12 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       refundableBet.externalTransactionId,
     );
     await refund.response.expect(201);
-    await submit('ROLLBACK', '10.00', refundRound, refund.externalTransactionId)
-      .response.expect(201);
+    await submit(
+      'ROLLBACK',
+      '10.00',
+      refundRound,
+      refund.externalTransactionId,
+    ).response.expect(201);
 
     await request(app.getHttpServer())
       .get(`/wallets/${walletId}`)
@@ -686,7 +767,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
     expect(counts.total_entries).toBe(8);
   });
 
-  it('redrives a permanently invalid message to the real DLQ', async () => {
+  it('moves a permanently invalid message to the real DLQ', async () => {
     const marker = randomUUID();
     await sqs.send(
       new SendMessageCommand({
@@ -697,7 +778,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       }),
     );
 
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + 10_000;
     let found = false;
     while (!found && Date.now() < deadline) {
       const received = await sqs.send(
@@ -725,7 +806,7 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       );
     }
     expect(found).toBe(true);
-  }, 35_000);
+  }, 15_000);
 
   it('rejects an exhausted pending reference without creating ledger', async () => {
     const playerId = randomUUID();
@@ -840,28 +921,31 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       .expect(201);
 
     await expect(
-      entityManager.fork().execute(
-        'update wallets set balance = -1 where id = ?',
-        [wallet.body.id],
-      ),
+      entityManager
+        .fork()
+        .execute('update wallets set balance = -1 where id = ?', [
+          wallet.body.id,
+        ]),
     ).rejects.toBeDefined();
 
-    const ledger = await entityManager.fork().execute<{ id: string }>(
-      'select id from wallet_ledger_entries where wallet_id = ? limit 1',
-      [wallet.body.id],
-      'get',
-    );
+    const ledger = await entityManager
+      .fork()
+      .execute<{ id: string }>(
+        'select id from wallet_ledger_entries where wallet_id = ? limit 1',
+        [wallet.body.id],
+        'get',
+      );
     await expect(
-      entityManager.fork().execute(
-        'update wallet_ledger_entries set amount = 9 where id = ?',
-        [ledger.id],
-      ),
+      entityManager
+        .fork()
+        .execute('update wallet_ledger_entries set amount = 9 where id = ?', [
+          ledger.id,
+        ]),
     ).rejects.toBeDefined();
     await expect(
-      entityManager.fork().execute(
-        'delete from wallet_ledger_entries where id = ?',
-        [ledger.id],
-      ),
+      entityManager
+        .fork()
+        .execute('delete from wallet_ledger_entries where id = ?', [ledger.id]),
     ).rejects.toBeDefined();
   });
 

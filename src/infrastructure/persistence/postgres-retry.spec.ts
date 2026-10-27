@@ -16,6 +16,7 @@ describe('PostgreSQL transaction retry', () => {
 
   it('retries a transient failure with exponential delay and jitter', async () => {
     const delays: number[] = [];
+    const retriedCodes: string[] = [];
     let calls = 0;
     const result = await withPostgresTransactionRetry(
       async () => {
@@ -30,12 +31,16 @@ describe('PostgreSQL transaction retry', () => {
           delays.push(delay);
           return Promise.resolve();
         },
+        onRetry: (error) => {
+          retriedCodes.push((error as { code: string }).code);
+        },
       },
     );
 
     expect(result).toBe('ok');
     expect(calls).toBe(3);
     expect(delays).toEqual([15, 25]);
+    expect(retriedCodes).toEqual(['40P01', '40001']);
   });
 
   it('stops at the configured attempt limit', async () => {

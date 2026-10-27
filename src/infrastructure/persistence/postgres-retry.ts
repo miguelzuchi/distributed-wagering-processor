@@ -5,6 +5,7 @@ export interface PostgresRetryOptions {
   baseDelayMs?: number;
   random?: () => number;
   sleep?: (delayMs: number) => Promise<void>;
+  onRetry?: (error: unknown) => Promise<void> | void;
 }
 
 interface PostgresErrorLike {
@@ -50,6 +51,7 @@ export async function withPostgresTransactionRetry<T>(
       if (attempt >= maxAttempts || !isTransientPostgresError(error)) {
         throw error;
       }
+      await options.onRetry?.(error);
       const exponentialDelay = baseDelayMs * 2 ** (attempt - 1);
       const jitter = Math.floor(random() * baseDelayMs);
       await sleep(exponentialDelay + jitter);

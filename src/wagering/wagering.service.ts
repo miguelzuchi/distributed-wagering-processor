@@ -645,8 +645,20 @@ export class WageringService {
   private transactionalWithRetry<T>(
     operation: (entityManager: EntityManager) => Promise<T>,
   ): Promise<T> {
-    return withPostgresTransactionRetry(() =>
-      this.entityManager.fork().transactional(operation),
+    return withPostgresTransactionRetry(
+      () => this.entityManager.fork().transactional(operation),
+      {
+        onRetry: async () => {
+          try {
+            await this.incrementCounter(
+              this.entityManager.fork(),
+              'lock_conflicts_total',
+            );
+          } catch {
+            // Metrics are best effort and must not prevent the financial retry.
+          }
+        },
+      },
     );
   }
 
@@ -885,7 +897,10 @@ export class WageringService {
     );
   }
 
-  private async incrementCounter(em: EntityManager, name: string): Promise<void> {
+  private async incrementCounter(
+    em: EntityManager,
+    name: string,
+  ): Promise<void> {
     await em.execute(
       `insert into operational_counters (name, value) values (?, 1)
        on conflict (name) do update

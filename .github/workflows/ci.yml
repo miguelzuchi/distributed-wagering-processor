@@ -37,8 +37,11 @@ jobs:
           docker compose exec -T localstack awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo
           docker compose exec -T localstack awslocal sqs get-queue-url --queue-name wager-events.fifo
 
-      - name: Apply database migrations
-        run: bun run db:migrate
+      - name: Verify reversible database migrations
+        run: |
+          bun run db:migrate
+          bun run db:migrate:down --to 0
+          bun run db:migrate
 
       - name: Run end-to-end tests
         run: bun run test:e2e
