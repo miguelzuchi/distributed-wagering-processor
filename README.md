@@ -2,11 +2,18 @@
 
 Serviço financeiro distribuído para processar transações de apostas entregues por múltiplos provedores. O projeto faz parte do desafio técnico da Jungle Gaming e prioriza correção financeira, concorrência, idempotência persistente e recuperação após falhas.
 
+Documentação complementar:
+
+- [Decisões arquiteturais](ARCHITECTURE.md)
+- [Referência da API](docs/API.md)
+- [Estratégia de testes](docs/TESTING.md)
+- [Matriz de requisitos](REQUIREMENTS.md)
+
 ## Estado atual
 
 O núcleo financeiro, abertura de wallet e processamento HTTP de transações estão implementados. `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` compartilham um caso de uso transacional com idempotência persistente, lock por wallet, ledger e outbox. Referências ausentes são persistidas como `PENDING_REFERENCE`.
 
-Há testes de concorrência HTTP contra PostgreSQL real, duas instâncias isoladas e dois processos completos da aplicação. Eles incluem 50 replays paralelos, apostas disputando o mesmo saldo entre réplicas e continuidade após o encerramento de uma delas. Ledger paginado, reconciliação e health checks de PostgreSQL/SQS também estão disponíveis. O consumidor SQS usa inbox atômica, auditoria de rejeições, ACK após commit e redrive para DLQ. O publisher concorrente da outbox usa claims com lease, `SKIP LOCKED`, fila de eventos dedicada e backoff persistente sem manter transações abertas durante chamadas de rede. Referências fora de ordem são reprocessadas automaticamente. Deadlocks e falhas de serialização do PostgreSQL têm retry limitado com backoff e jitter. Métricas Prometheus expõem o volume processado e os backlogs persistentes de inbox, outbox e referências. A CI valida build, lint, testes, migrations, E2E e a imagem de produção.
+Há testes de concorrência HTTP contra PostgreSQL real, duas instâncias isoladas e três processos completos da aplicação. Eles incluem 50 replays paralelos, apostas disputando o mesmo saldo entre réplicas, crash depois do commit e antes do ACK, redelivery sem efeito duplicado, redrive real até a DLQ e a matriz de rollback de BET, WIN e REFUND. Ledger paginado, reconciliação e health checks de PostgreSQL/SQS também estão disponíveis. O consumidor SQS usa inbox atômica, auditoria de rejeições, ACK após commit e redrive para DLQ. No shutdown ele interrompe novos polls, aguarda mensagens em andamento e devolve imediatamente a visibilidade das que excederem o prazo. O publisher concorrente da outbox usa claims com lease, `SKIP LOCKED`, fila de eventos dedicada e backoff persistente sem manter transações abertas durante chamadas de rede. Referências fora de ordem são reprocessadas automaticamente. Deadlocks e falhas de serialização do PostgreSQL têm retry limitado com backoff e jitter. Métricas Prometheus expõem volume processado, replays idempotentes, latência, lag e backlogs persistentes. A CI valida build, lint, testes, migrations, E2E e a imagem de produção.
 
 ## Stack
 
@@ -37,8 +44,17 @@ git --version
 ## Instalação
 
 ```bash
-bun install
-copy .env.example .env
+bun install --frozen-lockfile
+```
+
+```powershell
+# PowerShell
+Copy-Item .env.example .env
+```
+
+```bash
+# Linux/macOS
+cp .env.example .env
 ```
 
 ## Execução local
@@ -80,7 +96,11 @@ bun run infra:up    # sobe PostgreSQL e LocalStack
 bun run infra:down  # encerra a infraestrutura
 bun run infra:logs  # acompanha os logs dos containers
 bun run db:migrate  # aplica migrations pendentes
+bun run db:migrate:down # reverte a última migration
 ```
+
+Os testes E2E exigem a infraestrutura e as migrations ativas. Eles usam
+PostgreSQL e LocalStack reais; veja [docs/TESTING.md](docs/TESTING.md).
 
 ## Imagem de produção
 
@@ -115,7 +135,7 @@ O LocalStack está fixado na versão comunitária `4.4.0`. Versões publicadas a
 
 As credenciais de desenvolvimento existem apenas para o ambiente local e estão documentadas em `.env.example`. O arquivo `.env` real não é versionado.
 
-## Escopo planejado
+## Escopo implementado
 
 - `Money` imutável, sem uso de `number` para valores monetários.
 - Wallet com saldo materializado e ledger imutável.
@@ -129,27 +149,34 @@ As credenciais de desenvolvimento existem apenas para o ambiente local e estão 
 - Logs estruturados, métricas e health checks.
 - Testes de integração e concorrência com serviços reais em containers.
 
-## Estrutura inicial
+## Estrutura do projeto
 
 ```text
 distributed-wagering-processor/
 ├── infra/localstack/     # inicialização das filas locais
+├── docs/                 # referência de API e estratégia de testes
 ├── src/config/           # leitura e validação do ambiente
 ├── src/infrastructure/   # adaptadores, MikroORM e migrations
 ├── test/                 # testes end-to-end
 ├── .env.example          # contrato de configuração
 ├── compose.yaml          # PostgreSQL e LocalStack
+├── REQUIREMENTS.md       # requisito → implementação → teste
 ├── package.json          # dependências e comandos
 └── tsconfig.json         # TypeScript em modo estrito
 ```
 
 ## Decisões arquiteturais
 
-As decisões sobre modelagem monetária, locks, constraints, idempotência, inbox/outbox e tratamento de falhas serão registradas em `ARCHITECTURE.md` conforme forem implementadas.
+As decisões sobre modelagem monetária, locks, constraints, idempotência, inbox/outbox e tratamento de falhas estão registradas em `ARCHITECTURE.md`.
+
+O schema também valida que ledger, transaction e wallet pertencem à mesma
+moeda e wallet; impede autorreferência e mais de uma reversão processada do
+mesmo tipo. As migrations mais recentes foram verificadas em `down → up` contra
+PostgreSQL real.
 
 ## Autenticação
 
-Autenticação não será implementada na primeira etapa, pois não pontua no desafio. O código manterá um ponto de extensão explícito para integração futura com um provedor OIDC, como Keycloak.
+Autenticação não foi implementada porque não pontua no desafio. `AuthModule` registra um `NoAuthGuard` global e `ProviderIdentityPort` explicita o ponto de substituição por um provedor OIDC, como Keycloak.
 
 ## Licença
 

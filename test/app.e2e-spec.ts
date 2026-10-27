@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { EntityManager } from '@mikro-orm/postgresql';
-import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import {
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 import request from 'supertest';
 import { App } from 'supertest/types.js';
 import { AppModule } from '../src/app.module.js';
@@ -587,6 +591,273 @@ describe('HTTP API (e2e with PostgreSQL)', () => {
       status: 'REJECTED',
       failure_reason: 'HTTP_404_NotFoundException',
     });
+  });
+
+  it('processes LOSS and rolls back BET, WIN, and REFUND correctly', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const walletId = wallet.body.id as string;
+    const submit = (
+      kind: string,
+      amount: string,
+      roundId: string,
+      referenceExternalTransactionId?: string,
+    ) => {
+      const externalTransactionId = randomUUID();
+      return {
+        externalTransactionId,
+        response: request(app.getHttpServer())
+          .post('/wagering/transactions')
+          .set('Idempotency-Key', `provider-matrix:${externalTransactionId}`)
+          .send({
+            providerId: 'provider-matrix',
+            externalTransactionId,
+            playerId,
+            walletId,
+            roundId,
+            gameId: 'fortune-chimp',
+            kind,
+            money: { amount, currency: 'BRL' },
+            ...(referenceExternalTransactionId
+              ? { referenceExternalTransactionId }
+              : {}),
+          }),
+      };
+    };
+
+    const loss = submit('LOSS', '5.00', randomUUID());
+    await loss.response.expect(201);
+
+    const betRound = randomUUID();
+    const bet = submit('BET', '40.00', betRound);
+    await bet.response.expect(201);
+    await submit('ROLLBACK', '40.00', betRound, bet.externalTransactionId)
+      .response.expect(201);
+
+    const winRound = randomUUID();
+    const win = submit('WIN', '20.00', winRound);
+    await win.response.expect(201);
+    await submit('ROLLBACK', '20.00', winRound, win.externalTransactionId)
+      .response.expect(201);
+
+    const refundRound = randomUUID();
+    const refundableBet = submit('BET', '10.00', refundRound);
+    await refundableBet.response.expect(201);
+    const refund = submit(
+      'REFUND',
+      '10.00',
+      refundRound,
+      refundableBet.externalTransactionId,
+    );
+    await refund.response.expect(201);
+    await submit('ROLLBACK', '10.00', refundRound, refund.externalTransactionId)
+      .response.expect(201);
+
+    await request(app.getHttpServer())
+      .get(`/wallets/${walletId}`)
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.balance).toEqual({ amount: '90.00', currency: 'BRL' });
+      });
+    const counts = await entityManager.fork().execute<{
+      loss_entries: number;
+      total_entries: number;
+    }>(
+      `select
+        count(*) filter (where t.kind = 'LOSS')::int as loss_entries,
+        count(*)::int as total_entries
+       from wallet_ledger_entries l
+       join wager_transactions t on t.id = l.transaction_id
+       where l.wallet_id = ?`,
+      [walletId],
+      'get',
+    );
+    expect(counts.loss_entries).toBe(0);
+    expect(counts.total_entries).toBe(8);
+  });
+
+  it('redrives a permanently invalid message to the real DLQ', async () => {
+    const marker = randomUUID();
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: environment.sqs.wagerQueueUrl,
+        MessageGroupId: marker,
+        MessageDeduplicationId: marker,
+        MessageBody: JSON.stringify({ marker, type: 'InvalidMessage' }),
+      }),
+    );
+
+    const deadline = Date.now() + 10_000;
+    let found = false;
+    while (!found && Date.now() < deadline) {
+      // Receiving with zero visibility accelerates the broker's receive count
+      // deterministically while the application consumers exercise the same
+      // no-ACK path concurrently.
+      await sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: environment.sqs.wagerQueueUrl,
+          MaxNumberOfMessages: 1,
+          WaitTimeSeconds: 0,
+          VisibilityTimeout: 0,
+        }),
+      );
+      const received = await sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: environment.sqs.wagerDlqUrl,
+          MaxNumberOfMessages: 10,
+          WaitTimeSeconds: 1,
+          VisibilityTimeout: 0,
+        }),
+      );
+      found = (received.Messages ?? []).some((message) =>
+        message.Body?.includes(marker),
+      );
+    }
+    expect(found).toBe(true);
+  }, 15_000);
+
+  it('rejects an exhausted pending reference without creating ledger', async () => {
+    const playerId = randomUUID();
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      })
+      .expect(201);
+    const externalTransactionId = randomUUID();
+    const pending = await request(app.getHttpServer())
+      .post('/wagering/transactions')
+      .set('Idempotency-Key', `provider-expiry:${externalTransactionId}`)
+      .send({
+        providerId: 'provider-expiry',
+        externalTransactionId,
+        playerId,
+        walletId: wallet.body.id,
+        roundId: randomUUID(),
+        gameId: 'fortune-chimp',
+        kind: 'REFUND',
+        money: { amount: '10.00', currency: 'BRL' },
+        referenceExternalTransactionId: randomUUID(),
+      })
+      .expect(202);
+    const transactionId = pending.body.transactionId as string;
+    await entityManager.fork().execute(
+      `update wager_transactions
+          set reference_attempts = 7, reference_next_attempt_at = now()
+        where id = ?`,
+      [transactionId],
+    );
+
+    const deadline = Date.now() + 5_000;
+    let result: { status?: string; failureCode?: string } = {};
+    while (result.status !== 'REJECTED' && Date.now() < deadline) {
+      const response = await request(app.getHttpServer())
+        .get(`/wagering/transactions/${transactionId}`)
+        .expect(200);
+      result = response.body;
+      if (result.status !== 'REJECTED') {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    expect(result).toMatchObject({
+      status: 'REJECTED',
+      failureCode: 'REFERENCE_NOT_FOUND',
+    });
+    const audit = await entityManager.fork().execute<{
+      ledger_count: number;
+      rejection_event_count: number;
+    }>(
+      `select
+        (select count(*)::int from wallet_ledger_entries where transaction_id = ?)
+          as ledger_count,
+        (select count(*)::int from outbox_messages
+          where aggregate_id = ? and event_type = 'WagerTransactionRejected')
+          as rejection_event_count`,
+      [transactionId, transactionId],
+      'get',
+    );
+    expect(audit).toEqual({ ledger_count: 0, rejection_event_count: 1 });
+  });
+
+  it('recovers and publishes an outbox lease abandoned by another publisher', async () => {
+    const eventId = randomUUID();
+    const aggregateId = randomUUID();
+    await entityManager.fork().execute(
+      `insert into outbox_messages
+        (id, aggregate_id, event_type, payload, occurred_at, attempts,
+         claim_token, claim_until)
+       values (?, ?, 'LeaseRecoveryProbe', ?::jsonb, now(), 0, ?, now() - interval '1 second')`,
+      [
+        eventId,
+        aggregateId,
+        JSON.stringify({
+          eventId,
+          eventType: 'LeaseRecoveryProbe',
+          aggregateId,
+          correlationId: eventId,
+          occurredAt: new Date().toISOString(),
+          version: 1,
+          data: {},
+        }),
+        randomUUID(),
+      ],
+    );
+
+    const deadline = Date.now() + 5_000;
+    let published = false;
+    while (!published && Date.now() < deadline) {
+      const row = await entityManager.fork().execute<{ published: boolean }>(
+        `select published_at is not null as published
+           from outbox_messages where id = ?`,
+        [eventId],
+        'get',
+      );
+      published = row.published;
+      if (!published) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(published).toBe(true);
+  });
+
+  it('enforces financial constraints and ledger immutability in PostgreSQL', async () => {
+    const wallet = await request(app.getHttpServer())
+      .post('/wallets')
+      .send({
+        playerId: randomUUID(),
+        initialBalance: { amount: '10.00', currency: 'BRL' },
+      })
+      .expect(201);
+
+    await expect(
+      entityManager.fork().execute(
+        'update wallets set balance = -1 where id = ?',
+        [wallet.body.id],
+      ),
+    ).rejects.toBeDefined();
+
+    const ledger = await entityManager.fork().execute<{ id: string }>(
+      'select id from wallet_ledger_entries where wallet_id = ? limit 1',
+      [wallet.body.id],
+      'get',
+    );
+    await expect(
+      entityManager.fork().execute(
+        'update wallet_ledger_entries set amount = 9 where id = ?',
+        [ledger.id],
+      ),
+    ).rejects.toBeDefined();
+    await expect(
+      entityManager.fork().execute(
+        'delete from wallet_ledger_entries where id = ?',
+        [ledger.id],
+      ),
+    ).rejects.toBeDefined();
   });
 
   afterAll(async () => {

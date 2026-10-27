@@ -11,6 +11,7 @@ import { HealthModule } from './health/health.module.js';
 import { MessagingModule } from './messaging/messaging.module.js';
 import { MetricsModule } from './metrics/metrics.module.js';
 import { HttpLoggingMiddleware } from './observability/http-logging.middleware.js';
+import { AuthModule } from './auth/auth.module.js';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { HttpLoggingMiddleware } from './observability/http-logging.middleware.j
       load: [loadEnvironment],
       validate: validateEnvironment,
     }),
+    AuthModule,
     MikroOrmModule.forRoot(mikroOrmConfig),
     WalletsModule,
     WageringModule,

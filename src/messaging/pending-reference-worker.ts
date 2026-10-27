@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   OnApplicationBootstrap,
   OnModuleDestroy,
 } from '@nestjs/common';
@@ -9,6 +10,7 @@ import { WageringService } from '../wagering/wagering.service.js';
 export class PendingReferenceWorker
   implements OnApplicationBootstrap, OnModuleDestroy
 {
+  private readonly logger = new Logger(PendingReferenceWorker.name);
   private timer?: ReturnType<typeof setTimeout>;
   private stopped = false;
 
@@ -33,7 +35,11 @@ export class PendingReferenceWorker
     try {
       const processed = await this.wagering.reprocessDueReferences();
       this.schedule(processed > 0 ? 0 : 500);
-    } catch {
+    } catch (error) {
+      this.logger.warn({
+        event: 'pending_reference_batch_failed',
+        error: error instanceof Error ? error.name : 'UnknownError',
+      });
       this.schedule(1_000);
     }
   }

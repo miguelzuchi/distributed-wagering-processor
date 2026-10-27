@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 
 interface RunningReplica {
   process: ChildProcessWithoutNullStreams;
@@ -25,11 +26,19 @@ async function availablePort(): Promise<number> {
   return address.port;
 }
 
-async function startReplica(port: number): Promise<RunningReplica> {
+async function startReplica(
+  port: number,
+  environment: Record<string, string> = {},
+): Promise<RunningReplica> {
   let output = '';
   const child = spawn(process.execPath, ['dist/main.js'], {
     cwd: process.cwd(),
-    env: { ...process.env, NODE_ENV: 'test', PORT: String(port) },
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      PORT: String(port),
+      ...environment,
+    },
     stdio: 'pipe',
   });
   const append = (chunk: Buffer) => {
@@ -81,7 +90,8 @@ describe('multi-process deployment', () => {
   });
 
   it('keeps idempotency and wallet consistency across separate OS processes', async () => {
-    const [firstPort, secondPort] = await Promise.all([
+    const [firstPort, secondPort, thirdPort] = await Promise.all([
+      availablePort(),
       availablePort(),
       availablePort(),
     ]);
@@ -89,6 +99,8 @@ describe('multi-process deployment', () => {
     replicas.push(first);
     const second = await startReplica(secondPort);
     replicas.push(second);
+    const third = await startReplica(thirdPort);
+    replicas.push(third);
 
     const playerId = randomUUID();
     const walletResponse = await fetch(`${first.baseUrl}/wallets`, {
@@ -116,7 +128,7 @@ describe('multi-process deployment', () => {
     const responses = await Promise.all(
       Array.from({ length: 50 }, (_, index) =>
         fetch(
-          `${index % 2 === 0 ? first.baseUrl : second.baseUrl}/wagering/transactions`,
+          `${[first, second, third][index % 3]!.baseUrl}/wagering/transactions`,
           {
             method: 'POST',
             headers: {
@@ -147,5 +159,73 @@ describe('multi-process deployment', () => {
         `Surviving replica exited unexpectedly:\n${second.logs()}`,
       );
     }
+    await Promise.all([stopReplica(second), stopReplica(third)]);
+  }, 30_000);
+
+  it('redelivers safely when a worker dies after commit and before ACK', async () => {
+    const delayed = await startReplica(await availablePort(), {
+      SQS_ACK_DELAY_MS: '10000',
+    });
+    replicas.push(delayed);
+    const playerId = randomUUID();
+    const walletResponse = await fetch(`${delayed.baseUrl}/wallets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        playerId,
+        initialBalance: { amount: '100.00', currency: 'BRL' },
+      }),
+    });
+    const wallet = (await walletResponse.json()) as { id: string };
+    const externalTransactionId = randomUUID();
+    const sqs = new SQSClient({
+      region: 'us-east-1',
+      endpoint: 'http://localhost:4566',
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+    });
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl:
+          'http://localhost:4566/000000000000/wager-transactions.fifo',
+        MessageGroupId: wallet.id,
+        MessageDeduplicationId: randomUUID(),
+        MessageBody: JSON.stringify({
+          messageId: randomUUID(),
+          type: 'WagerTransactionRequested',
+          occurredAt: new Date().toISOString(),
+          data: {
+            providerId: 'provider-crash',
+            externalTransactionId,
+            idempotencyKey: `provider-crash:${externalTransactionId}`,
+            playerId,
+            walletId: wallet.id,
+            roundId: randomUUID(),
+            gameId: 'fortune-chimp',
+            kind: 'BET',
+            money: { amount: '25.00', currency: 'BRL' },
+          },
+        }),
+      }),
+    );
+
+    const deadline = Date.now() + 10_000;
+    let committed = false;
+    while (!committed && Date.now() < deadline) {
+      const response = await fetch(
+        `${delayed.baseUrl}/providers/provider-crash/wagering/transactions/${externalTransactionId}`,
+      );
+      committed = response.ok;
+      if (!committed) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(committed).toBe(true);
+    delayed.process.kill('SIGKILL');
+
+    const replacement = await startReplica(await availablePort());
+    replicas.push(replacement);
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    const state = await fetch(`${replacement.baseUrl}/wallets/${wallet.id}`);
+    const body = (await state.json()) as { balance: { amount: string } };
+    expect(body.balance.amount).toBe('75.00');
+    sqs.destroy();
   }, 30_000);
 });

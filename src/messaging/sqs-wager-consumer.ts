@@ -7,6 +7,7 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import {
+  ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
   Message,
   ReceiveMessageCommand,
@@ -42,6 +43,7 @@ export class SqsWagerConsumer
   });
   private stopped = false;
   private timer?: ReturnType<typeof setTimeout>;
+  private readonly inFlight = new Map<string, Promise<void>>();
 
   constructor(private readonly wagering: WageringService) {}
 
@@ -49,9 +51,29 @@ export class SqsWagerConsumer
     this.schedule(0);
   }
 
-  onModuleDestroy(): void {
+  async onModuleDestroy(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    const deadline = new Promise<void>((resolve) =>
+      setTimeout(resolve, 10_000).unref(),
+    );
+    await Promise.race([
+      Promise.allSettled(this.inFlight.values()).then(() => undefined),
+      deadline,
+    ]);
+    if (this.inFlight.size > 0) {
+      await Promise.allSettled(
+        [...this.inFlight.keys()].map((receiptHandle) =>
+          this.sqs.send(
+            new ChangeMessageVisibilityCommand({
+              QueueUrl: this.environment.sqs.wagerQueueUrl,
+              ReceiptHandle: receiptHandle,
+              VisibilityTimeout: 0,
+            }),
+          ),
+        ),
+      );
+    }
     this.sqs.destroy();
   }
 
@@ -68,12 +90,12 @@ export class SqsWagerConsumer
           QueueUrl: this.environment.sqs.wagerQueueUrl,
           MaxNumberOfMessages: 10,
           WaitTimeSeconds: 1,
-          VisibilityTimeout: 30,
+          VisibilityTimeout: this.environment.nodeEnv === 'test' ? 1 : 30,
           MessageSystemAttributeNames: ['ApproximateReceiveCount'],
         }),
       );
       await Promise.all(
-        (result.Messages ?? []).map((message) => this.handle(message)),
+        (result.Messages ?? []).map((message) => this.track(message)),
       );
       this.schedule(0);
     } catch (error) {
@@ -83,6 +105,16 @@ export class SqsWagerConsumer
       });
       this.schedule(1_000);
     }
+  }
+
+  private track(message: Message): Promise<void> {
+    if (!message.ReceiptHandle) return Promise.resolve();
+    const receiptHandle = message.ReceiptHandle;
+    const operation = this.handle(message).finally(() => {
+      this.inFlight.delete(receiptHandle);
+    });
+    this.inFlight.set(receiptHandle, operation);
+    return operation;
   }
 
   private async handle(message: Message): Promise<void> {
@@ -145,6 +177,13 @@ export class SqsWagerConsumer
   }
 
   private async ack(receiptHandle: string): Promise<void> {
+    const testDelay =
+      this.environment.nodeEnv === 'test'
+        ? Number.parseInt(process.env.SQS_ACK_DELAY_MS ?? '0', 10)
+        : 0;
+    if (Number.isFinite(testDelay) && testDelay > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, testDelay));
+    }
     await this.sqs.send(
       new DeleteMessageCommand({
         QueueUrl: this.environment.sqs.wagerQueueUrl,

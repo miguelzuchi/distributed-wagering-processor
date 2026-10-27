@@ -167,6 +167,7 @@ export class WageringService {
             'Idempotency key was already used with a different payload',
           );
         }
+        await this.incrementCounter(em, 'idempotent_replays_total');
         return complete(this.toResponse(replay, true));
       }
 
@@ -881,6 +882,15 @@ export class WageringService {
         JSON.stringify(event.toJSON()),
         event.occurredAt,
       ],
+    );
+  }
+
+  private async incrementCounter(em: EntityManager, name: string): Promise<void> {
+    await em.execute(
+      `insert into operational_counters (name, value) values (?, 1)
+       on conflict (name) do update
+         set value = operational_counters.value + 1`,
+      [name],
     );
   }
 

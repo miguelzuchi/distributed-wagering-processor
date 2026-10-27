@@ -1,12 +1,12 @@
 # Architecture
 
-Este documento registra as decisões arquiteturais do Distributed Wagering Processor. Ele será evoluído junto com a implementação.
+Este documento registra as decisões arquiteturais, garantias e trade-offs do Distributed Wagering Processor.
 
 ## Objetivos
 
 O sistema deve preservar correção financeira sob entrega duplicada, mensagens fora de ordem, concorrência entre instâncias e falhas parciais. PostgreSQL será a fonte final das invariantes; recursos de ordenação do SQS serão apenas otimizações.
 
-## Stack inicial
+## Stack
 
 - Bun como runtime, package manager e executor dos testes.
 - NestJS como composition root e camada de transporte.
@@ -39,26 +39,45 @@ A representação monetária é `numeric(20,2)` e o código a hidrata como `stri
 - aritmética válida para cada lançamento;
 - estados e formato terminal válidos;
 - imutabilidade do ledger por trigger que recusa `UPDATE` e `DELETE`.
+- correspondência de wallet e moeda entre ledger, transação e saldo materializado;
+- referência diferente da própria transação;
+- uma reversão processada por `(reference_transaction_id, kind)`.
 
-A migration inicial foi validada em PostgreSQL 16 real nos dois sentidos (`up`, `down`, `up`).
+As migrations mais recentes foram validadas em PostgreSQL 16 real nos dois sentidos (`up`, `down`, `up`).
 
 ## Mensageria local
 
-O LocalStack cria duas filas FIFO durante o startup. A fila principal usa a DLQ como redrive policy com `maxReceiveCount` igual a cinco. Deduplicação do broker não substituirá inbox nem idempotência persistente.
+O LocalStack cria três filas FIFO durante o startup: entrada, DLQ e eventos. A fila principal usa a DLQ como redrive policy com `maxReceiveCount` igual a cinco. Deduplicação do broker não substitui inbox nem idempotência persistente.
 
 O consumidor reutiliza `WageringService.submit`, passando um contexto de inbox. Inbox, transação financeira, wallet, ledger e outbox são confirmados na mesma transação PostgreSQL. O ACK (`DeleteMessage`) ocorre somente depois que o caso de uso retorna, portanto depois do commit. Erros de negócio terminais são persistidos na inbox com status `REJECTED` antes do ACK; se essa auditoria falhar, a mensagem permanece sem ACK.
 
-Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e mensagens inválidas ficam sem ACK; a visibility timeout permite redelivery e a redrive policy encaminha à DLQ após cinco recebimentos. `OnModuleDestroy` interrompe novos polls e destrói o cliente SQS.
+Erros HTTP de negócio são terminais e recebem ACK. Erros de infraestrutura e mensagens inválidas ficam sem ACK; a visibility timeout permite redelivery e a redrive policy encaminha à DLQ após cinco recebimentos. No shutdown, novos polls são interrompidos, mensagens em andamento recebem até dez segundos para terminar e as restantes têm a visibilidade devolvida antes da destruição do cliente.
 
-Um teste end-to-end envia uma mensagem FIFO ao LocalStack, espera a inbox processada e reenvia o mesmo `messageId`, comprovando um único débito.
+Os testes end-to-end cobrem inbox duplicada, redrive real, três processos e crash com `SIGKILL` depois do commit e antes do ACK, comprovando redelivery sem débito duplicado.
 
 Eventos de integração são publicados em `wager-events.fifo`. Publishers concorrentes reivindicam lotes com `FOR UPDATE SKIP LOCKED` e um lease persistente. A transação termina antes do I/O com SQS; assim, lentidão de rede não mantém locks nem conexões transacionais ocupadas. Claims abandonados expiram e podem ser retomados. Sucesso grava `published_at`, enquanto falha incrementa `attempts` e agenda backoff exponencial limitado a 60 segundos. O envio ocorre antes da marcação no banco, portanto uma queda nesse intervalo pode duplicar a publicação, mas nunca perder um evento. `eventId` é usado como deduplication ID e também permite deduplicação persistente no consumidor.
 
-Referências pendentes são examinadas em lotes de 25. Cada item é reprocessado em transação própria, com locks da transação e da wallet. O backoff é exponencial e limitado a 60 segundos; após oito tentativas sem referência, a transação é rejeitada com `REFERENCE_NOT_FOUND`. O teste fora de ordem entrega o REFUND antes da BET e comprova a aplicação posterior automática.
+Referências pendentes são examinadas em lotes de 25. Cada item é reprocessado em transação própria, com locks da transação e da wallet. O backoff é exponencial e limitado a 60 segundos; após oito tentativas sem referência, a transação é rejeitada com `REFERENCE_NOT_FOUND`. Os testes cobrem tanto REFUND antes da BET quanto expiração definitiva sem criação de ledger.
+
+## Transições de estado
+
+```text
+PENDING ───────────────► PROCESSED
+   │
+   ├─ referência ausente ─► PENDING_REFERENCE ─► PROCESSED
+   │                              └──────────────► REJECTED
+   ├─ regra de negócio ─────────────────────────► REJECTED
+   └─ falha permanente ─────────────────────────► FAILED
+```
+
+`PROCESSED`, `REJECTED` e `FAILED` são terminais. LOSS é processada sem ledger.
 
 ## Autenticação
 
-A primeira versão terá um ponto de extensão para um Identity Provider OIDC, mas não implementará autenticação. A decisão preserva o timebox para os itens que pontuam: correção financeira, concorrência e tolerância a falhas.
+A primeira versão não implementa autenticação. `AuthModule` registra um `NoAuthGuard`
+global e `ProviderIdentityPort` define o contrato que será substituído por um adapter
+OIDC. Health checks continuam públicos quando esse adapter for implementado. A decisão
+preserva o timebox para correção financeira, concorrência e tolerância a falhas.
 
 ## Concorrência
 
@@ -80,8 +99,22 @@ O ledger usa keyset pagination por `(created_at, id)` em ordem decrescente. O cu
 
 A reconciliação soma créditos e débitos diretamente do ledger e compara com o saldo materializado. Divergências são retornadas e logadas, nunca corrigidas implicitamente. Liveness não consulta dependências; readiness exige PostgreSQL e a fila SQS configurada.
 
+## Observabilidade
+
+Logs HTTP são estruturados, carregam correlation ID e não incluem payload
+financeiro completo. Métricas persistentes cobrem status, inbox, outbox,
+replays idempotentes, tentativas de publicação, latência média e lag da outbox.
+Detalhes operacionais e cenários automatizados estão em `docs/TESTING.md`.
+
 ## Decisões pendentes
 
 - Política de retenção para inbox, outbox publicada e transações antigas.
 - Tracing distribuído e alertas operacionais.
 - Estratégia de autenticação OIDC.
+
+## Limitações conhecidas
+
+- A entrega do outbox é `at-least-once`; consumidores precisam deduplicar por `eventId`.
+- Retenção e arquivamento de registros antigos dependem da política operacional do ambiente.
+- O adapter OIDC não faz parte desta entrega; o guard atual é deliberadamente permissivo.
+- SQL explícito torna locks e constraints visíveis, mas exige mais mapeamento do que o uso integral do Unit of Work.

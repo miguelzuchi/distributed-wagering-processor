@@ -13,6 +13,12 @@ describe('MetricsController', () => {
         outbox_retrying: '1',
         inbox_processed_total: '8',
         inbox_rejected_total: '2',
+        idempotent_replays_total: '7',
+        outbox_lag_seconds: '1.5',
+        processing_latency_seconds: '0.02',
+        transactions_processed: '9',
+        transactions_failed: '0',
+        transactions_pending: '0',
       },
     ]);
     const entityManager = { fork: () => ({ execute }) };
@@ -28,6 +34,9 @@ describe('MetricsController', () => {
     expect(result).toContain('wagering_transactions_pending_reference 2');
     expect(result).toContain('wagering_outbox_pending 3');
     expect(result).toContain('wagering_inbox_rejected_total 2');
+    expect(result).toContain('wagering_idempotent_replays_total 7');
+    expect(result).toContain('wagering_outbox_lag_seconds 1.5');
+    expect(result).toContain('wagering_transactions_processed 9');
     expect(execute).toHaveBeenCalledOnce();
   });
 
